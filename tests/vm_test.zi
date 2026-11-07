@@ -1,26 +1,419 @@
-// Runs Lua snippets through the embedding API; each must finish without error.
+// Unit tests of the embedding API: values, tables, natives, userdata,
+// errors, refs, limits and coroutines driven from the host.
 #import "vec"
 #import "vm"
 
-Check :: (L: *LuaState, name: string, source: string) -> bool {
+TestContext :: struct {
+    finalized: s64
+    hook_calls: s64
+    output: Vec(u8)
+}
+
+Point :: struct {
+    x: float64
+    y: float64
+}
+
+POINT_TAG :: 7;
+
+failures: s64 = 0;
+
+Expect :: (condition: bool, what: string) {
+    if condition { return }
+    print("FAIL %\n", what)
+    failures += 1
+}
+
+Contains :: (text: string, part: string) -> bool {
+    if part.count == 0 { return true }
+    i: s64 = 0
+    while i + part.count <= text.count {
+        j: s64 = 0
+        while j < part.count && text[i + j] == part[j] { j += 1 }
+        if j == part.count { return true }
+        i += 1
+    }
+    return false
+}
+
+TopText :: (L: *LuaState) -> string {
+    text, ok := LuaToString(L, -1)
+    if !ok { return "" }
+    return text
+}
+
+// Run a chunk that must succeed; leaves nothing on the stack.
+Run :: (L: *LuaState, name: string, source: string) {
     status := LuaDoString(L, source, name)
-    if status != LUA_OK {
-        message, ok := LuaToString(L, -1)
-        print("FAIL %: %\n", name, message)
-        LuaSetTop(L, 0)
-        return false
+    if status != LUA_OK { print("FAIL %: %\n", name, TopText(L)); failures += 1 }
+    LuaSetTop(L, 0)
+}
+
+// Run a chunk that must fail with a message containing `part`.
+RunFails :: (L: *LuaState, name: string, source: string, part: string) {
+    status := LuaDoString(L, source, name)
+    message := ifx status == LUA_OK then "" else TopText(L)
+    if status == LUA_OK || !Contains(message, part) {
+        print("FAIL %: expected an error containing '%', got status % '%'\n", name, part, status, message)
+        failures += 1
     }
     LuaSetTop(L, 0)
-    return true
+}
+
+// ---------------------------------------------------------------- natives
+
+Add :: (L: *LuaState) -> s32 {
+    a, ok1 := LuaCheckNumber(L, 1)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    b, ok2 := LuaCheckNumber(L, 2)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    LuaPushNumber(L, a + b)
+    return 1
+}
+
+// Returns its arguments in reverse order.
+Reverse :: (L: *LuaState) -> s32 {
+    n := LuaGetTop(L)
+    i := n
+    while i >= 1 { LuaPushValue(L, i); i -= 1 }
+    return n
+}
+
+// A native closure counting its calls in upvalue 1.
+Counter :: (L: *LuaState) -> s32 {
+    n := LuaToInteger(L, LuaUpvalueIndex(1)) + 1
+    LuaPushInteger(L, n)
+    LuaPushValue(L, -1)
+    LuaReplace(L, LuaUpvalueIndex(1))
+    return 1
+}
+
+Fail :: (L: *LuaState) -> s32 {
+    return LuaErrorText(L, "host refused")
+}
+
+// Calls its first argument in protected mode and returns status, message.
+Protect :: (L: *LuaState) -> s32 {
+    LuaPushValue(L, 1)
+    status := LuaPCall(L, 0, 1, 0)
+    LuaPushBoolean(L, status == LUA_OK)
+    LuaInsert(L, -2)
+    return 2
+}
+
+Wait :: (L: *LuaState) -> s32 {
+    return LuaYield(L, LuaGetTop(L))
+}
+
+Handler :: (L: *LuaState) -> s32 {
+    message, ok := LuaToString(L, 1)
+    text: Vec(u8)
+    BuilderAppend(text, "handled: ")
+    BuilderAppend(text, message)
+    LuaPushString(L, TextView(VecSlice(text, 0, text.count)))
+    VecFree(text)
+    return 1
+}
+
+Capture :: (context: *void, text: string) {
+    test := cast(*TestContext) context
+    BuilderAppend(test.output, text)
+}
+
+PointCoordinate :: (L: *LuaState, axis: s32) -> s32 {
+    data := LuaTestUserdata(L, 1, "Point")
+    if data == null { return LuaTypeError(L, 1, "Point") }
+    p := cast(*Point) data
+    LuaPushNumber(L, ifx axis == 0 then p.x else p.y)
+    return 1
+}
+
+PointX :: (L: *LuaState) -> s32 { return PointCoordinate(L, 0) }
+PointY :: (L: *LuaState) -> s32 { return PointCoordinate(L, 1) }
+
+FinalizePoint :: (L: *LuaState, data: *void, tag: s64) {
+    test := cast(*TestContext) LuaHost(L)
+    if tag == POINT_TAG { test.finalized += 1 }
+}
+
+StopAfterFive :: (L: *LuaState) -> bool {
+    test := cast(*TestContext) LuaHost(L)
+    test.hook_calls += 1
+    if test.hook_calls < 5 { return true }
+    LuaSetHookMessage(L, "time is up")
+    return false
+}
+
+StopNow :: (L: *LuaState) -> bool { return false }
+
+// ---------------------------------------------------------------- tests
+
+TestValues :: (L: *LuaState) {
+    LuaPushNil(L)
+    LuaPushBoolean(L, true)
+    LuaPushNumber(L, 2.5)
+    LuaPushInteger(L, 42)
+    LuaPushString(L, "hi")
+    Expect(LuaGetTop(L) == 5, "five values pushed")
+    Expect(LuaType(L, 1) == LUA_TYPE_NIL && LuaType(L, 2) == LUA_TYPE_BOOLEAN, "nil and boolean types")
+    Expect(LuaType(L, 3) == LUA_TYPE_NUMBER && LuaType(L, -1) == LUA_TYPE_STRING, "number and string types")
+    Expect(LuaType(L, 9) == LUA_TYPE_NONE && LuaIsNoneOrNil(L, 9), "missing index is none")
+    Expect(LuaTypeName(L, LuaType(L, -1)) == "string", "type name")
+    Expect(LuaToBoolean(L, 2) && !LuaToBoolean(L, 1), "truthiness")
+    Expect(LuaToNumber(L, 3) == 2.5 && LuaToInteger(L, 4) == 42, "numbers read back")
+    Expect(TopText(L) == "hi", "string reads back")
+    text, ok := LuaToString(L, 4)
+    Expect(ok && text == "42", "number converts to string")
+    Expect(!LuaIsString(L, 2) && LuaIsNumber(L, 4) && LuaIsString(L, 4), "string and number checks")
+
+    // Stack shuffling: [nil true 2.5 42 "hi"].
+    LuaInsert(L, 1)
+    Expect(LuaToInteger(L, -1) == 42 && TopText(L) == "42", "insert moves the top down (ToString converted it in place)")
+    Expect(LuaType(L, 1) == LUA_TYPE_STRING, "inserted at the bottom")
+    LuaRemove(L, 1)
+    LuaPushString(L, "x")
+    LuaReplace(L, -2)
+    Expect(LuaGetTop(L) == 4 && TopText(L) == "x", "replace overwrites below the top")
+    Expect(LuaToNumber(L, 3) == 2.5, "replace leaves other slots")
+    LuaPop(L, 2)
+    Expect(LuaGetTop(L) == 2, "pop")
+    LuaSetTop(L, 0)
+
+    LuaPushString(L, "from host")
+    LuaSetGlobal(L, "greeting")
+    Run(L, "=values", "assert(greeting == 'from host') answer = 6 * 7")
+    LuaGetGlobal(L, "answer")
+    Expect(LuaToInteger(L, -1) == 42, "global set from Lua")
+    LuaSetTop(L, 0)
+}
+
+TestTables :: (L: *LuaState) {
+    LuaNewTable(L)
+    LuaPushNumber(L, 5)
+    LuaSetField(L, -2, "five")
+    LuaPushString(L, "one")
+    LuaRawSetI(L, -2, 1)
+    LuaPushString(L, "two")
+    LuaRawSetI(L, -2, 2)
+    LuaPushString(L, "key")
+    LuaPushBoolean(L, true)
+    LuaSetTable(L, -3)
+    Expect(LuaObjLen(L, -1) == 2, "table length")
+    LuaGetField(L, -1, "five")
+    Expect(LuaToNumber(L, -1) == 5.0, "get field")
+    LuaPop(L, 1)
+    LuaRawGetI(L, -1, 2)
+    Expect(TopText(L) == "two", "raw get index")
+    LuaPop(L, 1)
+    LuaPushString(L, "key")
+    LuaRawGet(L, -2)
+    Expect(LuaToBoolean(L, -1), "raw get key")
+    LuaPop(L, 1)
+    pairs := 0
+    LuaPushNil(L)
+    while LuaNext(L, -2) == 1 {
+        pairs += 1
+        LuaPop(L, 1)
+    }
+    Expect(pairs == 4, "next visits every pair")
+    LuaSetGlobal(L, "config")
+    Run(L, "=tables", "assert(config.five == 5 and config[1] == 'one' and config.key == true)")
+
+    // __index through the API.
+    Run(L, "=meta", "proxy = setmetatable({}, {__index = function(t, k) return k .. '!' end})")
+    LuaGetGlobal(L, "proxy")
+    LuaGetField(L, -1, "hey")
+    Expect(TopText(L) == "hey!", "get field honours __index")
+    LuaSetTop(L, 0)
+}
+
+TestNatives :: (L: *LuaState) {
+    LuaRegister(L, "add", Add)
+    LuaRegister(L, "reverse", Reverse)
+    LuaRegister(L, "fail", Fail)
+    LuaRegister(L, "protect", Protect)
+    LuaPushInteger(L, 0)
+    LuaPushNativeClosure(L, Counter, 1, "counter")
+    LuaSetGlobal(L, "counter")
+    LuaNewTable(L)
+    LuaSetNative(L, -1, "add", Add)
+    LuaSetGlobal(L, "host")
+    Run(L, "=natives", "assert(add(2, 3) == 5 and host.add('1', 1) == 2) local a, b, c = reverse(1, 2, 3) assert(a == 3 and b == 2 and c == 1)")
+    Run(L, "=closure", "counter() counter() assert(counter() == 3)")
+    RunFails(L, "=argerror", "return add(1, {})", "bad argument #2 to 'add' (number expected, got table)")
+    RunFails(L, "=errortext", "fail()", "errortext:1: host refused")
+    Run(L, "=protect", "local ok, message = protect(function() error('inner') end) assert(not ok and message:find('inner'))")
+
+    // LuaPCall with a handler, from the host.
+    LuaPushNative(L, Handler, "handler")
+    LuaGetGlobal(L, "fail")
+    status := LuaPCall(L, 0, 0, 1)
+    Expect(status == LUA_ERRRUN && Contains(TopText(L), "handled: ") && Contains(TopText(L), "host refused"), "pcall handler sees the error")
+    LuaSetTop(L, 0)
+
+    // LuaCall from the host leaves results.
+    LuaGetGlobal(L, "add")
+    LuaPushNumber(L, 40)
+    LuaPushNumber(L, 2)
+    Expect(LuaCall(L, 2, 1) && LuaToNumber(L, -1) == 42.0, "call returns a result")
+    LuaSetTop(L, 0)
+}
+
+TestErrors :: (L: *LuaState) {
+    RunFails(L, "=boom", "local function f() error('boom') end f()", "boom:1: boom")
+    RunFails(L, "=boom", "local function f() error('boom') end f()", "stack traceback:")
+    RunFails(L, "=syntax", "local = 1", "syntax:1:")
+    RunFails(L, "=index", "local t = nil; return t.x", "attempt to index local 't' (a nil value)")
+    status := LuaLoadBuffer(L, "return ...", "=load")
+    Expect(status == LUA_OK && LuaIsFunction(L, -1), "load pushes a function")
+    LuaPushInteger(L, 9)
+    Expect(LuaPCall(L, 1, 1, 0) == LUA_OK && LuaToInteger(L, -1) == 9, "chunk receives varargs")
+    LuaSetTop(L, 0)
+    status = LuaLoadBuffer(L, "return +", "=bad")
+    Expect(status == LUA_ERRSYNTAX && Contains(TopText(L), "bad:1:"), "syntax error status")
+    LuaSetTop(L, 0)
+}
+
+TestUserdata :: (L: *LuaState, test: *TestContext) {
+    Expect(LuaNewMetatable(L, "Point"), "new metatable")
+    LuaNewTable(L)
+    LuaSetNative(L, -1, "x", PointX)
+    LuaSetNative(L, -1, "y", PointY)
+    LuaSetField(L, -2, "__index")
+    LuaPop(L, 1)
+    Expect(!LuaNewMetatable(L, "Point"), "metatable exists")
+    LuaPop(L, 1)
+
+    p: Point
+    p.x = 3.0
+    p.y = 4.0
+    LuaNewUserdataFinalized(L, cast(*void) *p, POINT_TAG, FinalizePoint)
+    LuaGetRegistryMetatable(L, "Point")
+    Expect(LuaSetMetatable(L, -2), "set metatable")
+    Expect(LuaIsUserdata(L, -1) && LuaUserdataTag(L, -1) == POINT_TAG, "userdata tag")
+    Expect(LuaToUserdata(L, -1) == cast(*void) *p, "userdata data")
+    Expect(LuaTestUserdata(L, -1, "Point") == cast(*void) *p, "test userdata")
+    LuaSetGlobal(L, "p")
+    Run(L, "=point", "assert(p:x() == 3 and p:y() == 4 and type(p) == 'userdata')")
+    RunFails(L, "=point", "return p.x({})", "Point expected, got table")
+    Run(L, "=point", "p = nil collectgarbage()")
+    Expect(test.finalized == 1, "finalizer ran on collection")
+
+    // A second one is finalized when the state closes (checked by Main).
+    q: Point
+    LuaNewUserdataFinalized(L, cast(*void) *q, POINT_TAG, FinalizePoint)
+    LuaSetGlobal(L, "q")
+}
+
+TestRefs :: (L: *LuaState) {
+    Run(L, "=ref", "function double(a) return a * 2 end")
+    LuaGetGlobal(L, "double")
+    ref := LuaRef(L)
+    Expect(ref > 0 && LuaGetTop(L) == 0, "ref pops the value")
+    Run(L, "=ref", "double = nil collectgarbage()")
+    LuaPushRef(L, ref)
+    LuaPushNumber(L, 21)
+    Expect(LuaPCall(L, 1, 1, 0) == LUA_OK && LuaToNumber(L, -1) == 42.0, "ref keeps the function alive")
+    LuaSetTop(L, 0)
+    LuaUnref(L, ref)
+    LuaPushNil(L)
+    Expect(LuaRef(L) == LUA_REFNIL, "nil ref")
+}
+
+TestEnvironment :: (L: *LuaState) {
+    Expect(LuaLoadBuffer(L, "leak = 5 return secret", "=sandbox") == LUA_OK, "load sandbox chunk")
+    LuaNewTable(L)
+    LuaPushString(L, "inside")
+    LuaSetField(L, -2, "secret")
+    Expect(LuaSetFenv(L, -2), "set function environment")
+    Expect(LuaPCall(L, 0, 1, 0) == LUA_OK && TopText(L) == "inside", "chunk reads its environment")
+    LuaSetTop(L, 0)
+    LuaGetGlobal(L, "leak")
+    Expect(LuaIsNil(L, -1), "sandbox globals stay inside")
+    LuaSetTop(L, 0)
+    Run(L, "=env", "assert(os.getenv('HOME') == nil and io.open('/etc/hostname') == nil)")
+}
+
+TestPrintSink :: (L: *LuaState, test: *TestContext) {
+    LuaSetPrintSink(L, Capture, cast(*void) test)
+    Run(L, "=print", "print('a', 1, nil, true) io.write('b', 2, '\\n')")
+    Expect(TextView(VecSlice(test.output, 0, test.output.count)) == "a\t1\tnil\ttrue\nb2\n", "print goes to the sink")
+}
+
+TestHooks :: (L: *LuaState, test: *TestContext) {
+    LuaSetHook(L, StopAfterFive, 1000)
+    RunFails(L, "=spin", "while true do end", "time is up")
+    Expect(test.hook_calls == 5, "hook called until it stops")
+    LuaSetHook(L, StopNow, 1)
+    RunFails(L, "=spin", "local function f() return f() end f()", "instruction limit exceeded")
+    LuaClearHook(L)
+    Run(L, "=after", "local s = 0 for i = 1, 100000 do s = s + i end assert(s == 5000050000)")
+}
+
+TestMemoryLimit :: (L: *LuaState) {
+    LuaCollectGarbage(L)
+    limits := LuaGetLimits(L)
+    limits.max_memory = LuaMemoryUsed(L) + 2097152
+    LuaSetLimits(L, limits)
+    RunFails(L, "=hog", "local t = {} for i = 1, 1e7 do t[i] = {i} end", "not enough memory")
+    Expect(LuaMemoryUsed(L) < limits.max_memory + 1048576, "limit not overshot by much")
+    limits.max_memory = 0
+    LuaSetLimits(L, limits)
+    Run(L, "=after", "local t = {} for i = 1, 1000 do t[i] = {i} end assert(#t == 1000)")
+}
+
+TestCoroutines :: (L: *LuaState) {
+    LuaRegister(L, "wait", Wait)
+    Expect(LuaLoadBuffer(L, "local a = ... local b = wait(a + 1) local c = wait(b * 2) return 'done', c", "=co") == LUA_OK, "load coroutine body")
+    LuaNewThread(L)
+    Expect(LuaType(L, 1) == LUA_TYPE_THREAD, "new thread")
+    LuaPushNumber(L, 1)
+    status, count := LuaResume(L, 1, 1)
+    Expect(status == LUA_YIELD && count == 1 && LuaToNumber(L, -1) == 2.0, "first yield")
+    LuaPop(L, count)
+    LuaPushNumber(L, 10)
+    status, count = LuaResume(L, 1, 1)
+    Expect(status == LUA_YIELD && count == 1 && LuaToNumber(L, -1) == 20.0, "second yield")
+    LuaPop(L, count)
+    LuaPushNumber(L, 7)
+    status, count = LuaResume(L, 1, 1)
+    Expect(status == LUA_OK && count == 2 && LuaToNumber(L, -1) == 7.0, "coroutine returns")
+    LuaPop(L, 1)
+    Expect(TopText(L) == "done", "first result")
+    LuaPop(L, 1)
+    status, count = LuaResume(L, 1, 0)
+    Expect(status == LUA_ERRRUN && Contains(TopText(L), "dead coroutine"), "dead coroutine")
+    LuaSetTop(L, 0)
+    Run(L, "=wrap", "local f = coroutine.wrap(function() wait(1) wait(2) return 3 end) assert(f() == 1 and f() == 2 and f() == 3)")
+    RunFails(L, "=main", "wait()", "outside a coroutine")
 }
 
 Main :: () -> s32 {
-    L: LuaState
-    LuaOpen(*L)
-    failures := 0
-    if !Check(*L, "=smoke", "local x = 1 + 2 assert(x == 3) print('smoke ok', x)") { failures += 1 }
-    LuaClose(*L)
-    if failures > 0 { return 1 }
+    test: TestContext
+    state: LuaState
+    L := *state
+    Expect(LuaOpen(L), "open")
+    Expect(!LuaOpen(L), "open twice")
+    LuaSetHost(L, cast(*void) *test)
+    TestValues(L)
+    TestTables(L)
+    TestNatives(L)
+    TestErrors(L)
+    TestUserdata(L, *test)
+    TestRefs(L)
+    TestEnvironment(L)
+    TestPrintSink(L, *test)
+    TestHooks(L, *test)
+    TestMemoryLimit(L)
+    TestCoroutines(L)
+    Expect(LuaGetTop(L) == 0, "stack balanced")
+    LuaClose(L)
+    Expect(test.finalized == 2, "close runs the remaining finalizer")
+    VecFree(test.output)
+    if failures > 0 {
+        print("vm tests: % failed\n", failures)
+        return 1
+    }
     print("vm tests passed\n")
     return 0
 }

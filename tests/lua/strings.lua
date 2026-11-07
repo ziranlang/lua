@@ -108,4 +108,7 @@ assert(#tostring(12345.678) == 9)
 local z = "a\0b"
 assert(#z == 3 and z:byte(2) == 0 and z:sub(3) == "b" and z .. "c" == "a\0bc")
 assert(("x\0y"):find("\0", 1, true) == 2 and ("x\0y"):gsub("%z", "-") == "x-y")
+-- LuaJIT 2.1 \u{XXX} escapes encode UTF-8.
+assert("\u{41}\u{e9}\u{20AC}\u{1F600}" == "A\195\169\226\130\172\240\159\152\128")
+assert(not loadstring("return \"\\u{110000}\"") and not loadstring("return \"\\u41\""))
 print("strings ok")

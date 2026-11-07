@@ -401,6 +401,7 @@ CollectGarbage :: (L: *LuaState) {
     L.allocated = size
     L.threshold = size * 2
     if L.threshold < 1048576 { L.threshold = 1048576 }
+    ClampThreshold(L)
     L.collecting = false
     RunFinalizers(L)
 }
@@ -430,4 +431,10 @@ RunFinalizers :: (L: *LuaState) {
         L.threads[th].top = top
     }
     L.collecting = false
+}
+
+// With a memory limit, collect no later than at the limit so the check in
+// GCStep sees every overshoot.
+ClampThreshold :: (L: *LuaState) #inline {
+    if L.limits.max_memory > 0 && L.threshold > L.limits.max_memory { L.threshold = L.limits.max_memory }
 }

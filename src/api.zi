@@ -424,7 +424,10 @@ LuaClose :: (L: *LuaState) {
     L.open = false
 }
 
-LuaSetLimits :: (L: *LuaState, limits: LuaLimits) { L.limits = limits }
+LuaSetLimits :: (L: *LuaState, limits: LuaLimits) {
+    L.limits = limits
+    ClampThreshold(L)
+}
 LuaGetLimits :: (L: *LuaState) -> LuaLimits { return L.limits }
 
 // Call `hook` every `count` checkpoints (Lua calls and loop back-edges).
@@ -539,9 +542,10 @@ LuaInsert :: (L: *LuaState, index: s32) {
     L.threads[th].stack[position] = v
 }
 
+// Move the top value into `index` (resolved before the pop, as in C).
 LuaReplace :: (L: *LuaState, index: s32) {
-    v := PopValue(L)
-    SetIndexValue(L, index, v)
+    SetIndexValue(L, index, IndexValue(L, -1))
+    L.threads[L.cur].top -= 1
 }
 
 // ---------------------------------------------------------------- reading
