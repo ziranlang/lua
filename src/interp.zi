@@ -1,0 +1,1579 @@
+// The interpreter: call frames, metamethod dispatch, error positions and the
+// bytecode loop. Errors propagate by return value: a failing operation sets
+// L.error and returns false, every caller returns at once, and the catcher
+// (pcall, a coroutine resume or the host's LuaPCall) truncates the frames.
+
+#scope_module
+
+MAX_TAG_LOOP :: 100;
+
+// Precall results.
+CALL_LUA :: 0;
+CALL_DONE :: 1;
+CALL_YIELD :: 2;
+CALL_ERROR :: -1;
+CALL_NOT_FUNCTION :: -2;
+
+// RegisterName kinds.
+NAME_NONE :: 0;
+NAME_GLOBAL :: 1;
+NAME_LOCAL :: 2;
+NAME_FIELD :: 3;
+NAME_METHOD :: 4;
+NAME_UPVALUE :: 5;
+
+// ---------------------------------------------------------------- strings
+
+TypeNameOf :: (t: u8) -> string {
+    if t == LUA_TNIL { return "nil" }
+    if t == LUA_TFALSE || t == LUA_TTRUE { return "boolean" }
+    if t == LUA_TNUMBER { return "number" }
+    if t == LUA_TSTRING { return "string" }
+    if t == LUA_TTABLE { return "table" }
+    if t == LUA_TFUNCTION { return "function" }
+    if t == LUA_TUSERDATA || t == LUA_TLIGHTUSERDATA { return "userdata" }
+    if t == LUA_TTHREAD { return "thread" }
+    return "proto"
+}
+
+AppendHex :: (out: *Vec(u8), value: u64, digits: s32) {
+    hex := "0123456789abcdef"
+    i := digits - 1
+    while i >= 0 {
+        VecPush(<<out, hex[cast(s64)((value >> cast(u64)(i * 4)) & 15)])
+        i -= 1
+    }
+}
+
+// The text tostring() gives a value without consulting __tostring.
+AppendValueText :: (L: *LuaState, out: *Vec(u8), v: LuaValue) {
+    t := v.t
+    if t == LUA_TNIL { BuilderAppend(<<out, "nil"); return }
+    if t == LUA_TFALSE { BuilderAppend(<<out, "false"); return }
+    if t == LUA_TTRUE { BuilderAppend(<<out, "true"); return }
+    if t == LUA_TNUMBER { AppendNumber(out, v.n); return }
+    if t == LUA_TSTRING { BuilderAppend(<<out, StrView(L, v.h)); return }
+    BuilderAppend(<<out, TypeNameOf(t))
+    BuilderAppend(<<out, ": 0x")
+    address: u64 = 0
+    if t == LUA_TLIGHTUSERDATA {
+        bits: NumberBits
+        bits.f = v.n
+        address = bits.u
+    } else {
+        address = (cast(u64) v.h << 5) + (cast(u64) t << 1) + 0x00100000
+    }
+    AppendHex(out, address, 8)
+}
+
+// The number a value converts to: numbers, and strings holding numerals.
+ToNumber :: (L: *LuaState, v: LuaValue) -> (value: float64, ok: bool) #inline {
+    if v.t == LUA_TNUMBER { return v.n, true }
+    if v.t == LUA_TSTRING { return ParseNumberText(StrView(L, v.h)) }
+    return 0.0, false
+}
+
+// Numbers convert to strings for concatenation and string functions.
+ToStringHandle :: (L: *LuaState, v: LuaValue) -> (h: s32, ok: bool) {
+    if v.t == LUA_TSTRING { return v.h, true }
+    if v.t == LUA_TNUMBER {
+        buffer: Vec(u8)
+        AppendNumber(*buffer, v.n)
+        h := InternBytes(L, *buffer)
+        VecFree(buffer)
+        return h, true
+    }
+    return -1, false
+}
+
+CompareStrings :: (L: *LuaState, a: s32, b: s32) -> s32 {
+    if a == b { return 0 }
+    na := L.strings[a].bytes.count
+    nb := L.strings[b].bytes.count
+    n := ifx na < nb then na else nb
+    i: s64 = 0
+    while i < n {
+        x := L.strings[a].bytes[i]
+        y := L.strings[b].bytes[i]
+        if x != y { return ifx x < y then -1 else 1 }
+        i += 1
+    }
+    if na == nb { return 0 }
+    return ifx na < nb then -1 else 1
+}
+
+// ---------------------------------------------------------------- positions
+
+// Lua's short source name: "=name" and "@file" lose their marker, other
+// chunks become [string "first line..."].
+AppendChunkId :: (L: *LuaState, out: *Vec(u8), source: s32) {
+    if source < 0 { BuilderAppend(<<out, "?"); return }
+    AppendChunkIdText(out, StrView(L, source))
+}
+
+AppendChunkIdText :: (out: *Vec(u8), text: string) {
+    limit: s64 = 60
+    if text.count > 0 && text[0] == #char "=" {
+        n := text.count - 1
+        if n > limit - 1 { n = limit - 1 }
+        BuilderAppend(<<out, text[1:1 + n])
+        return
+    }
+    if text.count > 0 && text[0] == #char "@" {
+        n := text.count - 1
+        if n <= limit - 1 {
+            BuilderAppend(<<out, text[1:])
+        } else {
+            BuilderAppend(<<out, "...")
+            keep := limit - 4
+            BuilderAppend(<<out, text[text.count - keep:])
+        }
+        return
+    }
+    BuilderAppend(<<out, "[string \"")
+    end: s64 = 0
+    while end < text.count && text[end] != 10 && text[end] != 13 { end += 1 }
+    room := limit - 15
+    truncated := end < text.count
+    if end > room { end = room; truncated = true }
+    BuilderAppend(<<out, text[0:end])
+    if truncated { BuilderAppend(<<out, "...") }
+    BuilderAppend(<<out, "\"]")
+}
+
+FrameLine :: (L: *LuaState, thread: s32, frame: s64) -> s32 {
+    if L.threads[thread].frames[frame].native { return -1 }
+    cl := L.threads[thread].frames[frame].closure
+    p := L.closures[cl].proto
+    pc := L.threads[thread].frames[frame].pc - 1
+    if pc < 0 { pc = 0 }
+    if pc >= L.protos[p].lines.count { return -1 }
+    return L.protos[p].lines[pc]
+}
+
+// "chunk:line: " for the frame `level` below the top (0 = top) when it runs
+// Lua code; nothing for natives.
+AppendWhere :: (L: *LuaState, out: *Vec(u8), level: s32) {
+    th := L.cur
+    frame := L.threads[th].frames.count - 1 - level
+    if frame < 0 { return }
+    if L.threads[th].frames[frame].native { return }
+    cl := L.threads[th].frames[frame].closure
+    AppendChunkId(L, out, L.protos[L.closures[cl].proto].source)
+    VecPush(<<out, #char ":")
+    Append(out, cast(s64) FrameLine(L, th, frame))
+    BuilderAppend(<<out, ": ")
+}
+
+SetError :: (L: *LuaState, value: LuaValue) -> bool {
+    L.error = value
+    L.error_traced = false
+    return false
+}
+
+ErrorText :: (L: *LuaState, text: string) -> bool {
+    return SetError(L, StringValue(Intern(L, text)))
+}
+
+// A runtime error positioned at the running Lua function.
+RuntimeError :: (L: *LuaState, text: string) -> bool {
+    message: Vec(u8)
+    AppendWhere(L, *message, 0)
+    BuilderAppend(message, text)
+    value := StringValue(InternBytes(L, *message))
+    VecFree(message)
+    return SetError(L, value)
+}
+
+LocalName :: (L: *LuaState, p: s32, reg: s32, pc: s64) -> s32 {
+    found: s32 = -1
+    i: s64 = 0
+    while i < L.protos[p].locvars.count {
+        lv := L.protos[p].locvars[i]
+        if lv.start_pc > pc { break }
+        if lv.reg == reg && (lv.end_pc < 0 || pc < lv.end_pc) { found = lv.name }
+        i += 1
+    }
+    return found
+}
+
+WritesRegister :: (ins: LuaInstr, reg: s32) -> bool {
+    op := ins.op
+    if op == OP_LOADNIL { return reg >= ins.a && reg < ins.a + ins.b }
+    if op == OP_SELF { return reg == ins.a || reg == ins.a + 1 }
+    if op == OP_CALL || op == OP_TAILCALL || op == OP_VARARG { return reg >= ins.a }
+    if op == OP_TFORCALL { return reg >= ins.a + 3 }
+    if op == OP_FORLOOP || op == OP_FORPREP { return reg >= ins.a && reg <= ins.a + 3 }
+    if op == OP_SETUPVAL || op == OP_SETGLOBAL || op == OP_SETTABLE || op == OP_SETFIELD || op == OP_SETBOX || op == OP_SETLIST { return false }
+    if op >= OP_JMP && op <= OP_JNLE { return false }
+    if op == OP_RETURN || op == OP_TFORLOOP { return false }
+    return reg == ins.a
+}
+
+// How register `reg` got its value before instruction `pc` of prototype p.
+RegisterName :: (L: *LuaState, p: s32, pc: s64, reg: s32) -> (kind: s32, name: s32) {
+    local := LocalName(L, p, reg, pc)
+    if local >= 0 { return NAME_LOCAL, local }
+    j := pc - 1
+    while j >= 0 {
+        ins := L.protos[p].code[j]
+        if WritesRegister(ins, reg) {
+            op := ins.op
+            if op == OP_GETGLOBAL { return NAME_GLOBAL, L.protos[p].constants[ins.b].h }
+            if op == OP_GETFIELD { return NAME_FIELD, L.protos[p].constants[ins.c].h }
+            if op == OP_GETTABLE && ins.c < 0 {
+                k := L.protos[p].constants[-1 - ins.c]
+                if k.t == LUA_TSTRING { return NAME_FIELD, k.h }
+            }
+            if op == OP_GETUPVAL { return NAME_UPVALUE, L.protos[p].upval_names[ins.b] }
+            if op == OP_GETBOX || op == OP_MOVE {
+                name := LocalName(L, p, ins.b, j)
+                if name >= 0 { return NAME_LOCAL, name }
+            }
+            if op == OP_SELF && reg == ins.a && ins.c < 0 {
+                k := L.protos[p].constants[-1 - ins.c]
+                if k.t == LUA_TSTRING { return NAME_METHOD, k.h }
+            }
+            return NAME_NONE, -1
+        }
+        j -= 1
+    }
+    return NAME_NONE, -1
+}
+
+NameKindText :: (kind: s32) -> string {
+    if kind == NAME_GLOBAL { return "global" }
+    if kind == NAME_LOCAL { return "local" }
+    if kind == NAME_FIELD { return "field" }
+    if kind == NAME_METHOD { return "method" }
+    if kind == NAME_UPVALUE { return "upvalue" }
+    return ""
+}
+
+// "attempt to <op> global 'x' (a nil value)" for register `reg` of the
+// running Lua frame; reg < 0 omits the variable.
+TypeError :: (L: *LuaState, v: LuaValue, op: string, reg: s32) -> bool {
+    message: Vec(u8)
+    BuilderAppend(message, "attempt to ")
+    BuilderAppend(message, op)
+    kind: s32 = NAME_NONE
+    name: s32 = -1
+    th := L.cur
+    top := L.threads[th].frames.count - 1
+    if reg >= 0 && top >= 0 && !L.threads[th].frames[top].native {
+        cl := L.threads[th].frames[top].closure
+        kind, name = RegisterName(L, L.closures[cl].proto, L.threads[th].frames[top].pc - 1, reg)
+    }
+    if kind != NAME_NONE {
+        VecPush(message, #char " ")
+        BuilderAppend(message, NameKindText(kind))
+        BuilderAppend(message, " '")
+        BuilderAppend(message, StrView(L, name))
+        BuilderAppend(message, "' (a ")
+    } else {
+        BuilderAppend(message, " a ")
+    }
+    BuilderAppend(message, TypeNameOf(v.t))
+    BuilderAppend(message, " value")
+    if kind != NAME_NONE { VecPush(message, #char ")") }
+    ok := RuntimeError(L, BytesView(*message))
+    VecFree(message)
+    return ok
+}
+
+OrderError :: (L: *LuaState, a: LuaValue, b: LuaValue) -> bool {
+    message: Vec(u8)
+    BuilderAppend(message, "attempt to compare ")
+    ta := TypeNameOf(a.t)
+    tb := TypeNameOf(b.t)
+    if ta == tb {
+        BuilderAppend(message, "two ")
+        BuilderAppend(message, ta)
+        BuilderAppend(message, " values")
+    } else {
+        BuilderAppend(message, ta)
+        BuilderAppend(message, " with ")
+        BuilderAppend(message, tb)
+    }
+    ok := RuntimeError(L, BytesView(*message))
+    VecFree(message)
+    return ok
+}
+
+// ---------------------------------------------------------------- tracebacks
+
+// The name a frame's function was called by, from the caller's call site.
+FrameFunctionName :: (L: *LuaState, thread: s32, frame: s64) -> (kind: s32, name: s32) {
+    if frame > 0 && L.threads[thread].frames[frame].tail == 0 {
+        caller := frame - 1
+        if !L.threads[thread].frames[caller].native {
+            cl := L.threads[thread].frames[caller].closure
+            p := L.closures[cl].proto
+            pc := L.threads[thread].frames[caller].pc - 1
+            if pc >= 0 && pc < L.protos[p].code.count {
+                ins := L.protos[p].code[pc]
+                if ins.op == OP_CALL || ins.op == OP_TAILCALL {
+                    return RegisterName(L, p, pc, ins.a)
+                }
+                if ins.op == OP_TFORCALL { return NAME_GLOBAL, -2 }
+            }
+        }
+    }
+    cl := L.threads[thread].frames[frame].closure
+    if L.threads[thread].frames[frame].native && L.closures[cl].name >= 0 {
+        return NAME_GLOBAL, L.closures[cl].name
+    }
+    return NAME_NONE, -1
+}
+
+AppendFrameText :: (L: *LuaState, out: *Vec(u8), thread: s32, frame: s64) {
+    cl := L.threads[thread].frames[frame].closure
+    native := L.threads[thread].frames[frame].native
+    if native {
+        BuilderAppend(<<out, "[C]:")
+    } else {
+        p := L.closures[cl].proto
+        AppendChunkId(L, out, L.protos[p].source)
+        VecPush(<<out, #char ":")
+        line := FrameLine(L, thread, frame)
+        if line > 0 {
+            Append(out, cast(s64) line)
+            VecPush(<<out, #char ":")
+        }
+    }
+    kind, name := FrameFunctionName(L, thread, frame)
+    if kind != NAME_NONE {
+        BuilderAppend(<<out, " in function '")
+        if name == -2 { BuilderAppend(<<out, "for iterator") } else { BuilderAppend(<<out, StrView(L, name)) }
+        VecPush(<<out, #char "'")
+    } else if native {
+        BuilderAppend(<<out, " ?")
+    } else {
+        p := L.closures[cl].proto
+        if L.protos[p].line_defined == 0 {
+            BuilderAppend(<<out, " in main chunk")
+        } else {
+            BuilderAppend(<<out, " in function <")
+            AppendChunkId(L, out, L.protos[p].source)
+            VecPush(<<out, #char ":")
+            Append(out, cast(s64) L.protos[p].line_defined)
+            VecPush(<<out, #char ">")
+        }
+    }
+    if L.threads[thread].frames[frame].tail > 0 {
+        BuilderAppend(<<out, "\n\t(tail call): ?")
+    }
+}
+
+// "stack traceback:" and the frames of `thread` from `level` below its top.
+AppendTraceback :: (L: *LuaState, out: *Vec(u8), thread: s32, level: s32) {
+    BuilderAppend(<<out, "stack traceback:")
+    first := L.threads[thread].frames.count - 1 - level
+    count := first + 1
+    frame := first
+    shown: s64 = 0
+    while frame >= 0 {
+        if shown == 12 && count > 22 {
+            BuilderAppend(<<out, "\n\t...")
+            frame = 9
+            shown += 1
+            continue
+        }
+        BuilderAppend(<<out, "\n\t")
+        AppendFrameText(L, out, thread, frame)
+        shown += 1
+        frame -= 1
+    }
+}
+
+// Run the innermost xpcall handler for the pending error while the frames
+// that raised it are still on the stack. pcall entries stop the search.
+TraceError :: (L: *LuaState) {
+    if L.error_traced { return }
+    L.error_traced = true
+    th := L.cur
+    count := L.threads[th].handlers.count
+    if count == 0 { return }
+    handler := L.threads[th].handlers[count - 1].handler
+    if handler.t == LUA_TNIL { return }
+    // Disarm the handler while it runs so its own errors do not recurse.
+    L.threads[th].handlers[count - 1].handler = NilValue()
+    L.handler_slack += 200
+    top := L.threads[th].top
+    if EnsureStack(L, top + 3) {
+        L.threads[th].stack[top] = handler
+        L.threads[th].stack[top + 1] = L.error
+        L.threads[th].top = top + 2
+        ok := CallValue(L, top, 1, 1)
+        if ok {
+            L.error = L.threads[th].stack[top]
+        } else {
+            L.error = StringValue(Intern(L, "error in error handling"))
+        }
+        L.threads[th].top = top
+    }
+    L.handler_slack -= 200
+    L.threads[th].handlers[count - 1].handler = handler
+    L.error_traced = true
+}
+
+// ---------------------------------------------------------------- hooks
+
+HookFire :: (L: *LuaState) -> bool {
+    if !L.hook_set {
+        L.hook_left = 1000000000
+        return true
+    }
+    L.hook_left = ifx L.hook_count > 0 then L.hook_count else 1000000000
+    hook := L.hook
+    L.error = NilValue()
+    if hook(L) { return true }
+    if L.error.t == LUA_TNIL { return RuntimeError(L, "instruction limit exceeded") }
+    L.error_traced = false
+    return false
+}
+
+// ---------------------------------------------------------------- calls
+
+// Copy `n` results from stack[first..] to stack[func..], adjusted to `want`.
+// Sets top just past the results.
+MoveResults :: (L: *LuaState, func: s64, first: s64, n: s64, want: s32) {
+    th := L.cur
+    count := n
+    if want >= 0 {
+        count = want
+        EnsureStack(L, func + count + 1)
+    }
+    i: s64 = 0
+    while i < count {
+        if i < n {
+            L.threads[th].stack[func + i] = L.threads[th].stack[first + i]
+        } else {
+            L.threads[th].stack[func + i] = NilValue()
+        }
+        i += 1
+    }
+    L.threads[th].top = func + count
+}
+
+PushFrame :: (L: *LuaState, frame: LuaFrame) {
+    VecPush(L.threads[L.cur].frames, frame)
+}
+
+PopFrame :: (L: *LuaState) {
+    th := L.cur
+    VecResize(L.threads[th].frames, L.threads[th].frames.count - 1)
+}
+
+// Start a call of the value at stack[func] with nargs arguments above it.
+// A Lua function gets a frame for Execute to run (CALL_LUA); a native runs to
+// completion here (CALL_DONE, results at func with top past them).
+Precall :: (L: *LuaState, func: s64, nargs: s32, want: s32) -> s32 {
+    th := L.cur
+    count := nargs
+    f := L.threads[th].stack[func]
+    if f.t != LUA_TFUNCTION {
+        tm := GetTM(L, f, TM_CALL)
+        if tm.t != LUA_TFUNCTION { return CALL_NOT_FUNCTION }
+        if !EnsureStack(L, func + count + 2) { RuntimeError(L, "stack overflow"); return CALL_ERROR }
+        i := func + count
+        while i >= func {
+            L.threads[th].stack[i + 1] = L.threads[th].stack[i]
+            i -= 1
+        }
+        L.threads[th].stack[func] = tm
+        count += 1
+        f = tm
+    }
+    cl := f.h
+    p := L.closures[cl].proto
+    if p >= 0 {
+        if L.threads[th].frames.count >= cast(s64)(L.limits.max_frames + L.handler_slack) {
+            RuntimeError(L, "stack overflow")
+            return CALL_ERROR
+        }
+        np := L.protos[p].num_params
+        ms := cast(s64) L.protos[p].max_stack
+        frame: LuaFrame
+        frame.closure = cl
+        frame.func = func
+        frame.want = want
+        frame.vararg = func + 1
+        if L.protos[p].is_vararg {
+            base := func + 1 + count
+            if !EnsureStack(L, base + ms + 1) { RuntimeError(L, "stack overflow"); return CALL_ERROR }
+            i: s64 = 0
+            while i < np {
+                if i < count {
+                    L.threads[th].stack[base + i] = L.threads[th].stack[func + 1 + i]
+                } else {
+                    L.threads[th].stack[base + i] = NilValue()
+                }
+                i += 1
+            }
+            frame.base = base
+            frame.vararg = func + 1 + np
+            frame.nvarargs = ifx count > np then count - np else 0
+            j := base + np
+            while j < base + ms { L.threads[th].stack[j] = NilValue(); j += 1 }
+        } else {
+            base := func + 1
+            if !EnsureStack(L, base + ms + 1) { RuntimeError(L, "stack overflow"); return CALL_ERROR }
+            j := base + (ifx count < np then count else np)
+            while j < base + ms { L.threads[th].stack[j] = NilValue(); j += 1 }
+            frame.base = base
+        }
+        PushFrame(L, frame)
+        L.threads[th].top = frame.base + ms
+        L.hook_left -= 1
+        if L.hook_left <= 0 {
+            if !HookFire(L) { return CALL_ERROR }
+        }
+        return CALL_LUA
+    }
+    // A native function.
+    if L.native_depth >= L.limits.max_native_depth + L.handler_slack {
+        RuntimeError(L, "C stack overflow")
+        return CALL_ERROR
+    }
+    if !EnsureStack(L, func + count + 24) { RuntimeError(L, "stack overflow"); return CALL_ERROR }
+    frame: LuaFrame
+    frame.closure = cl
+    frame.func = func
+    frame.base = func + 1
+    frame.want = want
+    frame.native = true
+    PushFrame(L, frame)
+    L.threads[th].top = func + 1 + count
+    native := L.closures[cl].native
+    L.native_depth += 1
+    n := native(L)
+    L.native_depth -= 1
+    if n < 0 {
+        if n == LUA_NATIVE_YIELD {
+            L.threads[th].yield_func = func
+            L.threads[th].yield_want = want
+            PopFrame(L)
+            return CALL_YIELD
+        }
+        if L.error_traced == false { TraceError(L) }
+        return CALL_ERROR
+    }
+    top := L.threads[th].top
+    available := top - (func + 1)
+    if cast(s64) n > available { n = cast(s32) available }
+    PopFrame(L)
+    MoveResults(L, func, top - n, n, want)
+    return CALL_DONE
+}
+
+// Call stack[func] with nargs arguments from native code; results land at
+// func (top just past them). False with L.error set on failure.
+CallValue :: (L: *LuaState, func: s64, nargs: s32, want: s32) -> bool {
+    th := L.cur
+    L.threads[th].nesting += 1
+    r := Precall(L, func, nargs, want)
+    ok := true
+    if r == CALL_LUA {
+        status := Execute(L, L.threads[th].frames.count - 1)
+        ok = status == LUA_OK
+    } else if r == CALL_NOT_FUNCTION {
+        TypeError(L, L.threads[th].stack[func], "call", -1)
+        TraceError(L)
+        ok = false
+    } else if r == CALL_YIELD {
+        RuntimeError(L, "attempt to yield across metamethod/C-call boundary")
+        TraceError(L)
+        ok = false
+    } else if r == CALL_ERROR {
+        TraceError(L)
+        ok = false
+    }
+    L.threads[th].nesting -= 1
+    return ok
+}
+
+// Call metamethod f(a, b) for one result.
+CallTM :: (L: *LuaState, f: LuaValue, a: LuaValue, b: LuaValue, out: *LuaValue) -> bool {
+    th := L.cur
+    top := L.threads[th].top
+    if !EnsureStack(L, top + 4) { return RuntimeError(L, "stack overflow") }
+    L.threads[th].stack[top] = f
+    L.threads[th].stack[top + 1] = a
+    L.threads[th].stack[top + 2] = b
+    L.threads[th].top = top + 3
+    if !CallValue(L, top, 2, 1) { return false }
+    <<out = L.threads[th].stack[top]
+    L.threads[th].top = top
+    return true
+}
+
+// Call metamethod f(a, b, c) for no results.
+CallTM3 :: (L: *LuaState, f: LuaValue, a: LuaValue, b: LuaValue, c: LuaValue) -> bool {
+    th := L.cur
+    top := L.threads[th].top
+    if !EnsureStack(L, top + 5) { return RuntimeError(L, "stack overflow") }
+    L.threads[th].stack[top] = f
+    L.threads[th].stack[top + 1] = a
+    L.threads[th].stack[top + 2] = b
+    L.threads[th].stack[top + 3] = c
+    L.threads[th].top = top + 4
+    if !CallValue(L, top, 3, 0) { return false }
+    L.threads[th].top = top
+    return true
+}
+
+// ---------------------------------------------------------------- operations
+
+GetIndex :: (L: *LuaState, t: LuaValue, key: LuaValue, out: *LuaValue, reg: s32) -> bool {
+    current := t
+    loop: s32 = 0
+    while loop < MAX_TAG_LOOP {
+        tm: LuaValue
+        if current.t == LUA_TTABLE {
+            v := RawGet(L, current.h, key)
+            if v.t != LUA_TNIL { <<out = v; return true }
+            tm = FastTM(L, L.tables[current.h].meta, TM_INDEX)
+            if tm.t == LUA_TNIL { <<out = v; return true }
+        } else {
+            tm = GetTM(L, current, TM_INDEX)
+            if tm.t == LUA_TNIL { return TypeError(L, current, "index", ifx loop == 0 then reg else -1) }
+        }
+        if tm.t == LUA_TFUNCTION { return CallTM(L, tm, current, key, out) }
+        current = tm
+        loop += 1
+    }
+    return RuntimeError(L, "loop in gettable")
+}
+
+ValidKey :: (L: *LuaState, key: LuaValue) -> bool {
+    if key.t == LUA_TNIL { return RuntimeError(L, "table index is nil") }
+    if key.t == LUA_TNUMBER && key.n != key.n { return RuntimeError(L, "table index is NaN") }
+    return true
+}
+
+SetIndex :: (L: *LuaState, t: LuaValue, key: LuaValue, value: LuaValue, reg: s32) -> bool {
+    current := t
+    loop: s32 = 0
+    while loop < MAX_TAG_LOOP {
+        tm: LuaValue
+        if current.t == LUA_TTABLE {
+            h := current.h
+            meta := L.tables[h].meta
+            if meta < 0 {
+                if !ValidKey(L, key) { return false }
+                RawSet(L, h, key, value)
+                return true
+            }
+            existing := RawGet(L, h, key)
+            if existing.t != LUA_TNIL {
+                RawSet(L, h, key, value)
+                return true
+            }
+            tm = FastTM(L, meta, TM_NEWINDEX)
+            if tm.t == LUA_TNIL {
+                if !ValidKey(L, key) { return false }
+                RawSet(L, h, key, value)
+                return true
+            }
+        } else {
+            tm = GetTM(L, current, TM_NEWINDEX)
+            if tm.t == LUA_TNIL { return TypeError(L, current, "index", ifx loop == 0 then reg else -1) }
+        }
+        if tm.t == LUA_TFUNCTION { return CallTM3(L, tm, current, key, value) }
+        current = tm
+        loop += 1
+    }
+    return RuntimeError(L, "loop in settable")
+}
+
+ArithNumbers :: (event: s32, a: float64, b: float64) -> float64 #inline {
+    if event == TM_ADD { return a + b }
+    if event == TM_SUB { return a - b }
+    if event == TM_MUL { return a * b }
+    if event == TM_DIV { return a / b }
+    if event == TM_MOD { return LuaMod(a, b) }
+    if event == TM_POW { return LuaPow(a, b) }
+    return -a
+}
+
+Arith :: (L: *LuaState, event: s32, b: LuaValue, c: LuaValue, out: *LuaValue, rb: s32, rc: s32) -> bool {
+    nb, okb := ToNumber(L, b)
+    nc, okc := ToNumber(L, c)
+    if okb && okc {
+        <<out = NumberValue(ArithNumbers(event, nb, nc))
+        return true
+    }
+    tm := GetTM(L, b, event)
+    if tm.t == LUA_TNIL { tm = GetTM(L, c, event) }
+    if tm.t != LUA_TNIL { return CallTM(L, tm, b, c, out) }
+    if okb { return TypeError(L, c, "perform arithmetic on", rc) }
+    return TypeError(L, b, "perform arithmetic on", rb)
+}
+
+// Compare metamethod shared by both operands, or nil.
+OrderTM :: (L: *LuaState, a: LuaValue, b: LuaValue, event: s32) -> LuaValue {
+    tm := GetTM(L, a, event)
+    if tm.t == LUA_TNIL { return tm }
+    other := GetTM(L, b, event)
+    if !RawEqual(tm, other) { return NilValue() }
+    return tm
+}
+
+EqualValues :: (L: *LuaState, a: LuaValue, b: LuaValue, out: *bool) -> bool {
+    if RawEqual(a, b) { <<out = true; return true }
+    if a.t != b.t || (a.t != LUA_TTABLE && a.t != LUA_TUSERDATA) { <<out = false; return true }
+    tm := OrderTM(L, a, b, TM_EQ)
+    if tm.t == LUA_TNIL { <<out = false; return true }
+    result: LuaValue
+    if !CallTM(L, tm, a, b, *result) { return false }
+    <<out = Truthy(result)
+    return true
+}
+
+LessThan :: (L: *LuaState, a: LuaValue, b: LuaValue, out: *bool) -> bool {
+    if a.t == LUA_TNUMBER && b.t == LUA_TNUMBER { <<out = a.n < b.n; return true }
+    if a.t == LUA_TSTRING && b.t == LUA_TSTRING { <<out = CompareStrings(L, a.h, b.h) < 0; return true }
+    if a.t == b.t {
+        tm := OrderTM(L, a, b, TM_LT)
+        if tm.t != LUA_TNIL {
+            result: LuaValue
+            if !CallTM(L, tm, a, b, *result) { return false }
+            <<out = Truthy(result)
+            return true
+        }
+    }
+    return OrderError(L, a, b)
+}
+
+LessEqual :: (L: *LuaState, a: LuaValue, b: LuaValue, out: *bool) -> bool {
+    if a.t == LUA_TNUMBER && b.t == LUA_TNUMBER { <<out = a.n <= b.n; return true }
+    if a.t == LUA_TSTRING && b.t == LUA_TSTRING { <<out = CompareStrings(L, a.h, b.h) <= 0; return true }
+    if a.t == b.t {
+        tm := OrderTM(L, a, b, TM_LE)
+        if tm.t != LUA_TNIL {
+            result: LuaValue
+            if !CallTM(L, tm, a, b, *result) { return false }
+            <<out = Truthy(result)
+            return true
+        }
+        tm = OrderTM(L, b, a, TM_LT)
+        if tm.t != LUA_TNIL {
+            result: LuaValue
+            if !CallTM(L, tm, b, a, *result) { return false }
+            <<out = !Truthy(result)
+            return true
+        }
+    }
+    return OrderError(L, a, b)
+}
+
+LengthOf :: (L: *LuaState, v: LuaValue, out: *LuaValue, reg: s32) -> bool {
+    if v.t == LUA_TSTRING { <<out = NumberValue(cast(float64) StrLen(L, v.h)); return true }
+    if v.t == LUA_TTABLE { <<out = NumberValue(cast(float64) TableLength(L, v.h)); return true }
+    tm := GetTM(L, v, TM_LEN)
+    if tm.t != LUA_TNIL { return CallTM(L, tm, v, NilValue(), out) }
+    return TypeError(L, v, "get length of", reg)
+}
+
+IsStringLike :: (v: LuaValue) -> bool #inline { return v.t == LUA_TSTRING || v.t == LUA_TNUMBER }
+
+// Concatenate stack[first..last] (absolute indices) into stack[first].
+ConcatRange :: (L: *LuaState, first: s64, last_index: s64, frame_base: s64) -> bool {
+    th := L.cur
+    last := last_index
+    while last > first {
+        top := L.threads[th].stack[last]
+        prev := L.threads[th].stack[last - 1]
+        if IsStringLike(prev) && IsStringLike(top) {
+            n: s64 = 2
+            while last - n >= first && IsStringLike(L.threads[th].stack[last - n]) { n += 1 }
+            start := last - n + 1
+            VecClear(L.scratch)
+            i := start
+            while i <= last {
+                v := L.threads[th].stack[i]
+                if v.t == LUA_TSTRING {
+                    BuilderAppend(L.scratch, StrView(L, v.h))
+                } else {
+                    AppendNumber(*L.scratch, v.n)
+                }
+                i += 1
+            }
+            h := InternBytes(L, *L.scratch)
+            L.threads[th].stack[start] = StringValue(h)
+            last = start
+        } else {
+            tm := GetTM(L, prev, TM_CONCAT)
+            if tm.t == LUA_TNIL { tm = GetTM(L, top, TM_CONCAT) }
+            if tm.t == LUA_TNIL {
+                culprit := ifx IsStringLike(prev) then last else last - 1
+                return TypeError(L, L.threads[th].stack[culprit], "concatenate", cast(s32)(culprit - frame_base))
+            }
+            result: LuaValue
+            if !CallTM(L, tm, prev, top, *result) { return false }
+            L.threads[th].stack[last - 1] = result
+            last -= 1
+        }
+    }
+    return true
+}
+
+// tostring() semantics including __tostring.
+ToStringMeta :: (L: *LuaState, v: LuaValue, out: *LuaValue) -> bool {
+    if v.t == LUA_TSTRING { <<out = v; return true }
+    tm := GetTM(L, v, TM_TOSTRING)
+    if tm.t != LUA_TNIL { return CallTM(L, tm, v, NilValue(), out) }
+    buffer: Vec(u8)
+    AppendValueText(L, *buffer, v)
+    <<out = StringValue(InternBytes(L, *buffer))
+    VecFree(buffer)
+    return true
+}
+
+// Collect when the allocation estimate passes the threshold; raise the
+// memory error when the limit is still exceeded afterwards.
+GCCheck :: (L: *LuaState) -> bool #inline {
+    if L.allocated < L.threshold { return true }
+    return GCStep(L)
+}
+
+GCStep :: (L: *LuaState) -> bool #cold {
+    if L.collecting { return true }
+    CollectGarbage(L)
+    if L.limits.max_memory > 0 && L.allocated > L.limits.max_memory {
+        return SetError(L, StringValue(Intern(L, "not enough memory")))
+    }
+    return true
+}
+
+ExecuteError :: (L: *LuaState) -> s32 #cold {
+    TraceError(L)
+    return LUA_ERRRUN
+}
+
+// ---------------------------------------------------------------- the loop
+
+// Run the frame at index `stop` of the running thread (and everything it
+// calls) until it returns. LUA_YIELD leaves the frames in place for resume.
+Execute :: (L: *LuaState, stop: s64) -> s32 {
+    th := L.cur
+    while true {
+        fi := L.threads[th].frames.count - 1
+        cl := L.threads[th].frames[fi].closure
+        p := L.closures[cl].proto
+        base := L.threads[th].frames[fi].base
+        pc := L.threads[th].frames[fi].pc
+        ms := cast(s64) L.protos[p].max_stack
+        code: *LuaInstr = *L.protos[p].code[0]
+        K: *LuaValue = null
+        if L.protos[p].constants.count > 0 { K = *L.protos[p].constants[0] }
+        R: *LuaValue = *L.threads[th].stack[base]
+        env := L.closures[cl].env
+
+        while true {
+            ins := code[pc]
+            pc += 1
+            a := ins.a
+            op := ins.op
+            if op == {
+            case OP_MOVE;
+                R[a] = R[ins.b]
+            case OP_LOADK;
+                R[a] = K[ins.b]
+            case OP_GETFIELD;
+                t := R[ins.b]
+                key := K[ins.c]
+                done := false
+                if t.t == LUA_TTABLE {
+                    v := GetStr(L, t.h, key.h)
+                    if v.t != LUA_TNIL || L.tables[t.h].meta < 0 {
+                        R[a] = v
+                        done = true
+                    }
+                }
+                if !done {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !GetIndex(L, t, key, *result, ins.b) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_GETTABLE;
+                t := R[ins.b]
+                key := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                done := false
+                if t.t == LUA_TTABLE {
+                    v: LuaValue
+                    if key.t == LUA_TNUMBER {
+                        index := SafeInteger(key.n)
+                        if cast(float64) index == key.n && index >= 1 && index <= L.tables[t.h].arr.count {
+                            v = L.tables[t.h].arr[index - 1]
+                        } else {
+                            v = RawGet(L, t.h, key)
+                        }
+                    } else {
+                        v = RawGet(L, t.h, key)
+                    }
+                    if v.t != LUA_TNIL || L.tables[t.h].meta < 0 {
+                        R[a] = v
+                        done = true
+                    }
+                }
+                if !done {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !GetIndex(L, t, key, *result, ins.b) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_GETGLOBAL;
+                key := K[ins.b]
+                v := GetStr(L, env, key.h)
+                if v.t != LUA_TNIL || L.tables[env].meta < 0 {
+                    R[a] = v
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !GetIndex(L, TableValue(env), key, *result, -1) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_GETBOX;
+                R[a] = L.boxes[R[ins.b].h].value
+            case OP_GETUPVAL;
+                R[a] = L.boxes[L.closures[cl].upvals[ins.b]].value
+            case OP_ADD;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    R[a] = NumberValue(b.n + c.n)
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !Arith(L, TM_ADD, b, c, *result, ins.b, ins.c) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_SUB;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    R[a] = NumberValue(b.n - c.n)
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !Arith(L, TM_SUB, b, c, *result, ins.b, ins.c) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_MUL;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    R[a] = NumberValue(b.n * c.n)
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !Arith(L, TM_MUL, b, c, *result, ins.b, ins.c) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_DIV;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    R[a] = NumberValue(b.n / c.n)
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !Arith(L, TM_DIV, b, c, *result, ins.b, ins.c) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_MOD;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    R[a] = NumberValue(LuaMod(b.n, c.n))
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !Arith(L, TM_MOD, b, c, *result, ins.b, ins.c) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_POW;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    R[a] = NumberValue(LuaPow(b.n, c.n))
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !Arith(L, TM_POW, b, c, *result, ins.b, ins.c) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_JMP;
+                if ins.a < pc {
+                    L.hook_left -= 1
+                    if L.hook_left <= 0 {
+                        L.threads[th].frames[fi].pc = pc
+                        if !HookFire(L) { return ExecuteError(L) }
+                        R = *L.threads[th].stack[base]
+                    }
+                }
+                pc = ins.a
+            case OP_JT;
+                if Truthy(R[ins.b]) {
+                    if ins.a < pc {
+                        L.hook_left -= 1
+                        if L.hook_left <= 0 {
+                            L.threads[th].frames[fi].pc = pc
+                            if !HookFire(L) { return ExecuteError(L) }
+                            R = *L.threads[th].stack[base]
+                        }
+                    }
+                    pc = ins.a
+                }
+            case OP_JF;
+                if !Truthy(R[ins.b]) {
+                    if ins.a < pc {
+                        L.hook_left -= 1
+                        if L.hook_left <= 0 {
+                            L.threads[th].frames[fi].pc = pc
+                            if !HookFire(L) { return ExecuteError(L) }
+                            R = *L.threads[th].stack[base]
+                        }
+                    }
+                    pc = ins.a
+                }
+            case OP_JEQ;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                equal := false
+                if b.t == c.t && b.t == LUA_TNUMBER {
+                    equal = b.n == c.n
+                } else if RawEqual(b, c) {
+                    equal = true
+                } else if b.t == c.t && (b.t == LUA_TTABLE || b.t == LUA_TUSERDATA) {
+                    L.threads[th].frames[fi].pc = pc
+                    if !EqualValues(L, b, c, *equal) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                if equal { pc = ins.a }
+            case OP_JNE;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                equal := false
+                if b.t == c.t && b.t == LUA_TNUMBER {
+                    equal = b.n == c.n
+                } else if RawEqual(b, c) {
+                    equal = true
+                } else if b.t == c.t && (b.t == LUA_TTABLE || b.t == LUA_TUSERDATA) {
+                    L.threads[th].frames[fi].pc = pc
+                    if !EqualValues(L, b, c, *equal) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                if !equal { pc = ins.a }
+            case OP_JLT;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                result := false
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    result = b.n < c.n
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    if !LessThan(L, b, c, *result) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                if result {
+                    if ins.a < pc {
+                        L.hook_left -= 1
+                        if L.hook_left <= 0 {
+                            L.threads[th].frames[fi].pc = pc
+                            if !HookFire(L) { return ExecuteError(L) }
+                            R = *L.threads[th].stack[base]
+                        }
+                    }
+                    pc = ins.a
+                }
+            case OP_JNLT;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                result := false
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    result = b.n < c.n
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    if !LessThan(L, b, c, *result) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                if !result {
+                    if ins.a < pc {
+                        L.hook_left -= 1
+                        if L.hook_left <= 0 {
+                            L.threads[th].frames[fi].pc = pc
+                            if !HookFire(L) { return ExecuteError(L) }
+                            R = *L.threads[th].stack[base]
+                        }
+                    }
+                    pc = ins.a
+                }
+            case OP_JLE;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                result := false
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    result = b.n <= c.n
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    if !LessEqual(L, b, c, *result) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                if result {
+                    if ins.a < pc {
+                        L.hook_left -= 1
+                        if L.hook_left <= 0 {
+                            L.threads[th].frames[fi].pc = pc
+                            if !HookFire(L) { return ExecuteError(L) }
+                            R = *L.threads[th].stack[base]
+                        }
+                    }
+                    pc = ins.a
+                }
+            case OP_JNLE;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                result := false
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    result = b.n <= c.n
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    if !LessEqual(L, b, c, *result) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                if !result {
+                    if ins.a < pc {
+                        L.hook_left -= 1
+                        if L.hook_left <= 0 {
+                            L.threads[th].frames[fi].pc = pc
+                            if !HookFire(L) { return ExecuteError(L) }
+                            R = *L.threads[th].stack[base]
+                        }
+                    }
+                    pc = ins.a
+                }
+            case OP_CALL;
+                func := base + a
+                nargs: s32 = 0
+                if ins.b != 0 {
+                    nargs = ins.b - 1
+                    L.threads[th].top = func + 1 + nargs
+                } else {
+                    nargs = cast(s32)(L.threads[th].top - func - 1)
+                }
+                want := ins.c - 1
+                L.threads[th].frames[fi].pc = pc
+                r := Precall(L, func, nargs, want)
+                if r == CALL_LUA { break }
+                if r == CALL_NOT_FUNCTION {
+                    TypeError(L, L.threads[th].stack[func], "call", a)
+                    return ExecuteError(L)
+                }
+                if r == CALL_ERROR { return ExecuteError(L) }
+                if r == CALL_YIELD { return LUA_YIELD }
+                if want >= 0 { L.threads[th].top = base + ms }
+                if L.allocated >= L.threshold {
+                    if !GCStep(L) { return ExecuteError(L) }
+                }
+                R = *L.threads[th].stack[base]
+                env = L.closures[cl].env
+            case OP_RETURN;
+                first := base + a
+                n: s64 = 0
+                if ins.b != 0 { n = ins.b - 1 } else { n = L.threads[th].top - first }
+                func := L.threads[th].frames[fi].func
+                want := L.threads[th].frames[fi].want
+                S: *LuaValue = *L.threads[th].stack[0]
+                i: s64 = 0
+                if want < 0 {
+                    while i < n { S[func + i] = S[first + i]; i += 1 }
+                } else {
+                    // The caller reserved registers for `want` results.
+                    if func + want >= L.threads[th].stack.count {
+                        EnsureStack(L, func + want + 1)
+                        S = *L.threads[th].stack[0]
+                    }
+                    while i < want {
+                        if i < n { S[func + i] = S[first + i] } else { S[func + i] = NilValue() }
+                        i += 1
+                    }
+                }
+                VecResize(L.threads[th].frames, fi)
+                if fi == stop {
+                    L.threads[th].top = func + (ifx want < 0 then n else cast(s64) want)
+                    return LUA_OK
+                }
+                if want < 0 {
+                    L.threads[th].top = func + n
+                } else {
+                    caller := fi - 1
+                    ccl := L.threads[th].frames[caller].closure
+                    L.threads[th].top = L.threads[th].frames[caller].base + L.protos[L.closures[ccl].proto].max_stack
+                }
+                break
+            case OP_SETFIELD;
+                t := R[a]
+                key := K[ins.b]
+                value := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                if t.t == LUA_TTABLE && L.tables[t.h].meta < 0 {
+                    SetStr(L, t.h, key.h, value)
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    if !SetIndex(L, t, key, value, a) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+            case OP_SETTABLE;
+                t := R[a]
+                key := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                value := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                done := false
+                if t.t == LUA_TTABLE && L.tables[t.h].meta < 0 {
+                    if key.t == LUA_TNUMBER {
+                        index := SafeInteger(key.n)
+                        if cast(float64) index == key.n {
+                            SetInt(L, t.h, index, value)
+                            done = true
+                        }
+                    } else if key.t == LUA_TSTRING {
+                        SetStr(L, t.h, key.h, value)
+                        done = true
+                    }
+                }
+                if !done {
+                    L.threads[th].frames[fi].pc = pc
+                    if !SetIndex(L, t, key, value, a) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+            case OP_SETGLOBAL;
+                key := K[ins.b]
+                if L.tables[env].meta < 0 {
+                    SetStr(L, env, key.h, R[a])
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    if !SetIndex(L, TableValue(env), key, R[a], -1) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+            case OP_SETBOX;
+                L.boxes[R[a].h].value = ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+            case OP_SETUPVAL;
+                L.boxes[L.closures[cl].upvals[ins.b]].value = R[a]
+            case OP_SELF;
+                object := R[ins.b]
+                key := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                R[a + 1] = object
+                done := false
+                if object.t == LUA_TTABLE && key.t == LUA_TSTRING {
+                    v := GetStr(L, object.h, key.h)
+                    if v.t != LUA_TNIL || L.tables[object.h].meta < 0 {
+                        R[a] = v
+                        done = true
+                    }
+                }
+                if !done {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !GetIndex(L, object, key, *result, ins.b) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_FORLOOP;
+                step := R[a + 2].n
+                index := R[a].n + step
+                limit := R[a + 1].n
+                if (step > 0.0 && index <= limit) || (step <= 0.0 && index >= limit) {
+                    R[a].n = index
+                    R[a + 3] = NumberValue(index)
+                    L.hook_left -= 1
+                    if L.hook_left <= 0 {
+                        L.threads[th].frames[fi].pc = pc
+                        if !HookFire(L) { return ExecuteError(L) }
+                        R = *L.threads[th].stack[base]
+                    }
+                    pc = ins.b
+                }
+            case OP_TFORCALL;
+                f := R[a]
+                nvars := ins.c
+                handled := false
+                if f.t == LUA_TFUNCTION && R[a + 1].t == LUA_TTABLE {
+                    if f.h == L.next_fn {
+                        L.threads[th].frames[fi].pc = pc
+                        found, ok := TableNext(L, R[a + 1].h, R[a + 2], *R[a + 3], *R[a + 4])
+                        if !ok {
+                            RuntimeError(L, "invalid key to 'next'")
+                            return ExecuteError(L)
+                        }
+                        if !found { R[a + 3] = NilValue() }
+                        j: s32 = 2
+                        while j < nvars { R[a + 3 + j] = NilValue(); j += 1 }
+                        handled = true
+                    } else if f.h == L.inext_fn {
+                        index := R[a + 2].n + 1.0
+                        v := GetInt(L, R[a + 1].h, SafeInteger(index))
+                        if v.t == LUA_TNIL {
+                            R[a + 3] = NilValue()
+                        } else {
+                            R[a + 3] = NumberValue(index)
+                            R[a + 4] = v
+                        }
+                        j: s32 = 2
+                        while j < nvars { R[a + 3 + j] = NilValue(); j += 1 }
+                        handled = true
+                    }
+                }
+                if !handled {
+                    R[a + 3] = R[a]
+                    R[a + 4] = R[a + 1]
+                    R[a + 5] = R[a + 2]
+                    func := base + a + 3
+                    L.threads[th].top = func + 3
+                    L.threads[th].frames[fi].pc = pc
+                    r := Precall(L, func, 2, nvars)
+                    if r == CALL_LUA { break }
+                    if r == CALL_NOT_FUNCTION {
+                        TypeError(L, L.threads[th].stack[func], "call", a)
+                        return ExecuteError(L)
+                    }
+                    if r == CALL_ERROR { return ExecuteError(L) }
+                    if r == CALL_YIELD { return LUA_YIELD }
+                    L.threads[th].top = base + ms
+                    R = *L.threads[th].stack[base]
+                    env = L.closures[cl].env
+                }
+            case OP_TFORLOOP;
+                if R[a + 3].t != LUA_TNIL {
+                    R[a + 2] = R[a + 3]
+                    L.hook_left -= 1
+                    if L.hook_left <= 0 {
+                        L.threads[th].frames[fi].pc = pc
+                        if !HookFire(L) { return ExecuteError(L) }
+                        R = *L.threads[th].stack[base]
+                    }
+                    pc = ins.b
+                }
+            case OP_LOADNIL;
+                j: s32 = 0
+                while j < ins.b { R[a + j] = NilValue(); j += 1 }
+            case OP_LOADBOOL;
+                R[a] = BoolValue(ins.b != 0)
+            case OP_NOT;
+                R[a] = BoolValue(!Truthy(R[ins.b]))
+            case OP_UNM;
+                b := R[ins.b]
+                if b.t == LUA_TNUMBER {
+                    R[a] = NumberValue(-b.n)
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !Arith(L, TM_UNM, b, b, *result, ins.b, ins.b) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_LEN;
+                b := R[ins.b]
+                if b.t == LUA_TSTRING {
+                    R[a] = NumberValue(cast(float64) L.strings[b.h].bytes.count)
+                } else if b.t == LUA_TTABLE {
+                    R[a] = NumberValue(cast(float64) TableLength(L, b.h))
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    result: LuaValue
+                    if !LengthOf(L, b, *result, ins.b) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                    R[a] = result
+                }
+            case OP_CONCAT;
+                L.threads[th].frames[fi].pc = pc
+                if !ConcatRange(L, base + ins.b, base + ins.c, base) { return ExecuteError(L) }
+                R = *L.threads[th].stack[base]
+                R[a] = R[ins.b]
+                if L.allocated >= L.threshold {
+                    if !GCStep(L) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+            case OP_EQ;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                equal := false
+                if RawEqual(b, c) {
+                    equal = true
+                } else if b.t == c.t && (b.t == LUA_TTABLE || b.t == LUA_TUSERDATA) {
+                    L.threads[th].frames[fi].pc = pc
+                    if !EqualValues(L, b, c, *equal) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                R[a] = BoolValue(equal)
+            case OP_NE;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                equal := false
+                if RawEqual(b, c) {
+                    equal = true
+                } else if b.t == c.t && (b.t == LUA_TTABLE || b.t == LUA_TUSERDATA) {
+                    L.threads[th].frames[fi].pc = pc
+                    if !EqualValues(L, b, c, *equal) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                R[a] = BoolValue(!equal)
+            case OP_LT;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                result := false
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    result = b.n < c.n
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    if !LessThan(L, b, c, *result) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                R[a] = BoolValue(result)
+            case OP_LE;
+                b := ifx ins.b < 0 then K[-1 - ins.b] else R[ins.b]
+                c := ifx ins.c < 0 then K[-1 - ins.c] else R[ins.c]
+                result := false
+                if b.t == LUA_TNUMBER && c.t == LUA_TNUMBER {
+                    result = b.n <= c.n
+                } else {
+                    L.threads[th].frames[fi].pc = pc
+                    if !LessEqual(L, b, c, *result) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+                R[a] = BoolValue(result)
+            case OP_NEWTABLE;
+                R[a] = TableValue(NewTable(L, ins.b, ins.c))
+                if L.allocated >= L.threshold {
+                    L.threads[th].frames[fi].pc = pc
+                    if !GCStep(L) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+            case OP_SETLIST;
+                t := R[a].h
+                n := cast(s64) ins.b
+                if n == 0 {
+                    n = L.threads[th].top - (base + a) - 1
+                    L.threads[th].top = base + ms
+                }
+                j: s64 = 1
+                while j <= n {
+                    SetInt(L, t, cast(s64) ins.c + j, R[a + j])
+                    j += 1
+                }
+            case OP_CLOSURE;
+                child := L.protos[p].protos[ins.b]
+                fresh := NewClosureObject(L)
+                L.closures[fresh].proto = child
+                L.closures[fresh].env = env
+                count := L.protos[child].upvals.count
+                if count > 0 { VecReserve(L.closures[fresh].upvals, count) }
+                j: s64 = 0
+                while j < count {
+                    desc := L.protos[child].upvals[j]
+                    box: s32 = 0
+                    if desc.from_local {
+                        box = R[desc.index].h
+                    } else {
+                        box = L.closures[cl].upvals[desc.index]
+                    }
+                    VecPush(L.closures[fresh].upvals, box)
+                    j += 1
+                }
+                L.allocated += count * 4
+                R[a] = FunctionValue(fresh)
+                if L.allocated >= L.threshold {
+                    L.threads[th].frames[fi].pc = pc
+                    if !GCStep(L) { return ExecuteError(L) }
+                    R = *L.threads[th].stack[base]
+                }
+            case OP_NEWBOX;
+                box := NewBox(L, R[a])
+                R[a] = ObjectValue(LUA_TBOX, box)
+            case OP_VARARG;
+                nv := cast(s64) L.threads[th].frames[fi].nvarargs
+                source := L.threads[th].frames[fi].vararg
+                want := cast(s64)(ins.b - 1)
+                if want < 0 {
+                    want = nv
+                    if !EnsureStack(L, base + a + nv + 1) {
+                        L.threads[th].frames[fi].pc = pc
+                        RuntimeError(L, "stack overflow")
+                        return ExecuteError(L)
+                    }
+                    L.threads[th].top = base + a + nv
+                    R = *L.threads[th].stack[base]
+                }
+                S: *LuaValue = *L.threads[th].stack[0]
+                j: s64 = 0
+                while j < want {
+                    if j < nv { R[a + j] = S[source + j] } else { R[a + j] = NilValue() }
+                    j += 1
+                }
+            case OP_TAILCALL;
+                func := base + a
+                nargs: s32 = 0
+                if ins.b != 0 {
+                    nargs = ins.b - 1
+                    L.threads[th].top = func + 1 + nargs
+                } else {
+                    nargs = cast(s32)(L.threads[th].top - func - 1)
+                }
+                L.threads[th].frames[fi].pc = pc
+                f := R[a]
+                if f.t == LUA_TFUNCTION && L.closures[f.h].proto >= 0 {
+                    dest := L.threads[th].frames[fi].func
+                    want := L.threads[th].frames[fi].want
+                    tail := L.threads[th].frames[fi].tail + 1
+                    S: *LuaValue = *L.threads[th].stack[0]
+                    j: s64 = 0
+                    while j <= nargs { S[dest + j] = S[func + j]; j += 1 }
+                    VecResize(L.threads[th].frames, fi)
+                    r := Precall(L, dest, nargs, want)
+                    if r != CALL_LUA { return ExecuteError(L) }
+                    L.threads[th].frames[fi].tail = tail
+                    break
+                }
+                r := Precall(L, func, nargs, LUA_MULTRET)
+                if r == CALL_LUA { break }
+                if r == CALL_NOT_FUNCTION {
+                    TypeError(L, L.threads[th].stack[func], "call", a)
+                    return ExecuteError(L)
+                }
+                if r == CALL_ERROR { return ExecuteError(L) }
+                if r == CALL_YIELD { return LUA_YIELD }
+                R = *L.threads[th].stack[base]
+            case OP_FORPREP;
+                init, ok1 := ToNumber(L, R[a])
+                limit, ok2 := ToNumber(L, R[a + 1])
+                step, ok3 := ToNumber(L, R[a + 2])
+                if !ok1 || !ok2 || !ok3 {
+                    L.threads[th].frames[fi].pc = pc
+                    what := ifx !ok1 then "'for' initial value must be a number" else (ifx !ok2 then "'for' limit must be a number" else "'for' step must be a number")
+                    RuntimeError(L, what)
+                    return ExecuteError(L)
+                }
+                R[a] = NumberValue(init - step)
+                R[a + 1] = NumberValue(limit)
+                R[a + 2] = NumberValue(step)
+                pc = ins.b
+            case;
+                L.threads[th].frames[fi].pc = pc
+                RuntimeError(L, "bad opcode")
+                return ExecuteError(L)
+            }
+        }
+        // A call pushed a frame or a return popped one: reload.
+    }
+    return LUA_OK
+}

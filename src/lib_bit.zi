@@ -1,0 +1,146 @@
+// LuaJIT's bit library: 32-bit operations returning signed results.
+
+#scope_module
+
+// LuaJIT's normalization: round to an integer and keep the low 32 bits.
+ToBit :: (x: float64) -> u32 #inline {
+    bits: NumberBits
+    bits.f = x + 6755399441055744.0
+    return cast(u32)(bits.u & 0xFFFFFFFF)
+}
+
+BitResult :: (L: *LuaState, x: u32) -> s32 #inline {
+    Push(L, NumberValue(cast(float64) cast(s32) x))
+    return 1
+}
+
+BitArg :: (L: *LuaState, n: s32) -> (value: u32, ok: bool) #inline {
+    x, ok := LuaCheckNumber(L, n)
+    if !ok { return 0, false }
+    return ToBit(x), true
+}
+
+BitToBit :: (L: *LuaState) -> s32 {
+    x, ok := BitArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return BitResult(L, x)
+}
+
+BitBnot :: (L: *LuaState) -> s32 {
+    x, ok := BitArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return BitResult(L, ~x)
+}
+
+BIT_AND :: 0;
+BIT_OR :: 1;
+BIT_XOR :: 2;
+
+BitFold :: (L: *LuaState, op: s32) -> s32 {
+    x, ok := BitArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    n := ArgCount(L)
+    i: s32 = 2
+    while i <= n {
+        y, oky := BitArg(L, i)
+        if !oky { return LUA_NATIVE_ERROR }
+        if op == BIT_AND { x &= y } else if op == BIT_OR { x |= y } else { x ^= y }
+        i += 1
+    }
+    return BitResult(L, x)
+}
+
+BitBand :: (L: *LuaState) -> s32 { return BitFold(L, BIT_AND) }
+BitBor :: (L: *LuaState) -> s32 { return BitFold(L, BIT_OR) }
+BitBxor :: (L: *LuaState) -> s32 { return BitFold(L, BIT_XOR) }
+
+ShiftArgs :: (L: *LuaState) -> (x: u32, n: u32, ok: bool) {
+    x, ok1 := BitArg(L, 1)
+    if !ok1 { return 0, 0, false }
+    n, ok2 := BitArg(L, 2)
+    if !ok2 { return 0, 0, false }
+    return x, n & 31, true
+}
+
+BitLshift :: (L: *LuaState) -> s32 {
+    x, n, ok := ShiftArgs(L)
+    if !ok { return LUA_NATIVE_ERROR }
+    return BitResult(L, x << n)
+}
+
+BitRshift :: (L: *LuaState) -> s32 {
+    x, n, ok := ShiftArgs(L)
+    if !ok { return LUA_NATIVE_ERROR }
+    return BitResult(L, x >> n)
+}
+
+BitArshift :: (L: *LuaState) -> s32 {
+    x, n, ok := ShiftArgs(L)
+    if !ok { return LUA_NATIVE_ERROR }
+    return BitResult(L, cast(u32)(cast(s32) x >> cast(s32) n))
+}
+
+BitRol :: (L: *LuaState) -> s32 {
+    x, n, ok := ShiftArgs(L)
+    if !ok { return LUA_NATIVE_ERROR }
+    if n == 0 { return BitResult(L, x) }
+    return BitResult(L, (x << n) | (x >> (32 - n)))
+}
+
+BitRor :: (L: *LuaState) -> s32 {
+    x, n, ok := ShiftArgs(L)
+    if !ok { return LUA_NATIVE_ERROR }
+    if n == 0 { return BitResult(L, x) }
+    return BitResult(L, (x >> n) | (x << (32 - n)))
+}
+
+BitBswap :: (L: *LuaState) -> s32 {
+    x, ok := BitArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    y := (x >> 24) | ((x >> 8) & 0xFF00) | ((x << 8) & 0xFF0000) | (x << 24)
+    return BitResult(L, y)
+}
+
+BitTohex :: (L: *LuaState) -> s32 {
+    x, ok := BitArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    n: s64 = 8
+    if Arg(L, 2).t != LUA_TNIL {
+        value, okn := BitArg(L, 2)
+        if !okn { return LUA_NATIVE_ERROR }
+        n = cast(s64) cast(s32) value
+    }
+    upper := false
+    if n < 0 {
+        upper = true
+        n = -n
+    }
+    if n > 8 { n = 8 }
+    digits := ifx upper then "0123456789ABCDEF" else "0123456789abcdef"
+    out: Vec(u8)
+    i := n - 1
+    while i >= 0 {
+        VecPush(out, digits[cast(s64)((x >> cast(u32)(i * 4)) & 15)])
+        i -= 1
+    }
+    Push(L, StringValue(InternBytes(L, *out)))
+    VecFree(out)
+    return 1
+}
+
+OpenBit :: (L: *LuaState) {
+    t := NewTable(L, 0, 12)
+    RegisterLibrary(L, "bit", t)
+    SetNative(L, t, "tobit", BitToBit)
+    SetNative(L, t, "tohex", BitTohex)
+    SetNative(L, t, "bnot", BitBnot)
+    SetNative(L, t, "band", BitBand)
+    SetNative(L, t, "bor", BitBor)
+    SetNative(L, t, "bxor", BitBxor)
+    SetNative(L, t, "lshift", BitLshift)
+    SetNative(L, t, "rshift", BitRshift)
+    SetNative(L, t, "arshift", BitArshift)
+    SetNative(L, t, "rol", BitRol)
+    SetNative(L, t, "ror", BitRor)
+    SetNative(L, t, "bswap", BitBswap)
+}

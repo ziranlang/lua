@@ -1,0 +1,421 @@
+// Lua 5.1 lexer over a borrowed source view. Names and string literals are
+// interned immediately; the parser receives string handles.
+
+#scope_module
+
+TK_AND :: 257;
+TK_BREAK :: 258;
+TK_DO :: 259;
+TK_ELSE :: 260;
+TK_ELSEIF :: 261;
+TK_END :: 262;
+TK_FALSE :: 263;
+TK_FOR :: 264;
+TK_FUNCTION :: 265;
+TK_IF :: 266;
+TK_IN :: 267;
+TK_LOCAL :: 268;
+TK_NIL :: 269;
+TK_NOT :: 270;
+TK_OR :: 271;
+TK_REPEAT :: 272;
+TK_RETURN :: 273;
+TK_THEN :: 274;
+TK_TRUE :: 275;
+TK_UNTIL :: 276;
+TK_WHILE :: 277;
+TK_CONCAT :: 278;
+TK_DOTS :: 279;
+TK_EQ :: 280;
+TK_GE :: 281;
+TK_LE :: 282;
+TK_NE :: 283;
+TK_NUMBER :: 284;
+TK_NAME :: 285;
+TK_STRING :: 286;
+TK_EOS :: 287;
+
+RESERVED_COUNT :: 21;
+
+Token :: struct {
+    kind: s32
+    line: s32
+    num: float64
+    str: s32
+}
+
+Lexer :: struct {
+    L: *LuaState
+    src: string
+    pos: s64
+    line: s32
+    chunk: string
+    tok: Token
+    ahead: Token
+    has_ahead: bool
+    last_line: s32
+    failed: bool
+    message: Vec(u8)
+    buf: Vec(u8)
+}
+
+ReservedWords :: () -> [21]string {
+    words: [21]string = .["and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while"]
+    return words
+}
+
+// Mark reserved words in the string table so the lexer finds them by handle.
+InternReserved :: (L: *LuaState) {
+    words := ReservedWords()
+    i: s32 = 0
+    while i < RESERVED_COUNT {
+        h := Intern(L, words[i])
+        L.strings[h].reserved = cast(u8)(i + 1)
+        i += 1
+    }
+}
+
+TokenText :: (kind: s32, out: *Vec(u8)) {
+    if kind < 257 {
+        VecPush(<<out, cast(u8) kind)
+        return
+    }
+    if kind < 257 + RESERVED_COUNT {
+        words := ReservedWords()
+        BuilderAppend(<<out, words[kind - 257])
+        return
+    }
+    if kind == TK_CONCAT { BuilderAppend(<<out, ".."); return }
+    if kind == TK_DOTS { BuilderAppend(<<out, "..."); return }
+    if kind == TK_EQ { BuilderAppend(<<out, "=="); return }
+    if kind == TK_GE { BuilderAppend(<<out, ">="); return }
+    if kind == TK_LE { BuilderAppend(<<out, "<="); return }
+    if kind == TK_NE { BuilderAppend(<<out, "~="); return }
+    if kind == TK_NUMBER { BuilderAppend(<<out, "<number>"); return }
+    if kind == TK_NAME { BuilderAppend(<<out, "<name>"); return }
+    if kind == TK_STRING { BuilderAppend(<<out, "<string>"); return }
+    BuilderAppend(<<out, "<eof>")
+}
+
+LexError :: (lx: *Lexer, message: string, near: bool) {
+    if lx.failed { return }
+    lx.failed = true
+    VecClear(lx.message)
+    AppendChunkIdText(*lx.message, lx.chunk)
+    VecPush(lx.message, #char ":")
+    Append(*lx.message, cast(s64) lx.line)
+    BuilderAppend(lx.message, ": ")
+    BuilderAppend(lx.message, message)
+    if near {
+        BuilderAppend(lx.message, " near '")
+        if lx.tok.kind == TK_NAME || lx.tok.kind == TK_STRING {
+            BuilderAppend(lx.message, StrView(lx.L, lx.tok.str))
+        } else if lx.tok.kind == TK_NUMBER {
+            AppendNumber(*lx.message, lx.tok.num)
+        } else {
+            TokenText(lx.tok.kind, *lx.message)
+        }
+        VecPush(lx.message, #char "'")
+    }
+}
+
+IsAlpha :: (c: u8) -> bool #inline { return (c >= #char "a" && c <= #char "z") || (c >= #char "A" && c <= #char "Z") || c == #char "_" }
+IsDigit :: (c: u8) -> bool #inline { return c >= #char "0" && c <= #char "9" }
+IsAlnum :: (c: u8) -> bool #inline { return IsAlpha(c) || IsDigit(c) }
+IsSpace :: (c: u8) -> bool #inline { return c == 32 || (c >= 9 && c <= 13) }
+IsXDigit :: (c: u8) -> bool #inline { return IsDigit(c) || (c >= #char "a" && c <= #char "f") || (c >= #char "A" && c <= #char "F") }
+
+Peek :: (lx: *Lexer, offset: s64) -> u8 #inline {
+    at := lx.pos + offset
+    if at >= lx.src.count { return 0 }
+    return lx.src[at]
+}
+
+AtEnd :: (lx: *Lexer) -> bool #inline { return lx.pos >= lx.src.count }
+
+// Consume a newline sequence (\n, \r, \n\r or \r\n).
+SkipNewline :: (lx: *Lexer) {
+    c := lx.src[lx.pos]
+    lx.pos += 1
+    if !AtEnd(lx) {
+        d := lx.src[lx.pos]
+        if (d == 10 || d == 13) && d != c { lx.pos += 1 }
+    }
+    lx.line += 1
+}
+
+// Level of a long bracket at pos ([==[ gives 2), or -1 when not one.
+LongBracketLevel :: (lx: *Lexer) -> s32 {
+    open := lx.src[lx.pos]
+    at := lx.pos + 1
+    level: s32 = 0
+    while at < lx.src.count && lx.src[at] == #char "=" { level += 1; at += 1 }
+    if at < lx.src.count && lx.src[at] == open { return level }
+    return -1 - level
+}
+
+// Read [[...]] content starting at pos (on the first bracket).
+ReadLongString :: (lx: *Lexer, level: s32, keep: bool) -> bool {
+    lx.pos += 2 + cast(s64) level
+    VecClear(lx.buf)
+    // Skip a first newline.
+    if !AtEnd(lx) && (lx.src[lx.pos] == 10 || lx.src[lx.pos] == 13) { SkipNewline(lx) }
+    while true {
+        if AtEnd(lx) {
+            LexError(lx, ifx keep then "unfinished long string" else "unfinished long comment", false)
+            return false
+        }
+        c := lx.src[lx.pos]
+        if c == #char "]" {
+            at := lx.pos + 1
+            count: s32 = 0
+            while at < lx.src.count && lx.src[at] == #char "=" { count += 1; at += 1 }
+            if count == level && at < lx.src.count && lx.src[at] == #char "]" {
+                lx.pos = at + 1
+                return true
+            }
+            if keep { VecPush(lx.buf, c) }
+            lx.pos += 1
+        } else if c == 10 || c == 13 {
+            if keep { VecPush(lx.buf, 10) }
+            SkipNewline(lx)
+        } else {
+            if keep { VecPush(lx.buf, c) }
+            lx.pos += 1
+        }
+    }
+    return false
+}
+
+ReadString :: (lx: *Lexer, quote: u8) -> bool {
+    lx.pos += 1
+    VecClear(lx.buf)
+    while true {
+        if AtEnd(lx) { LexError(lx, "unfinished string", false); return false }
+        c := lx.src[lx.pos]
+        if c == quote { lx.pos += 1; return true }
+        if c == 10 || c == 13 { LexError(lx, "unfinished string", false); return false }
+        if c == #char "\\" {
+            lx.pos += 1
+            if AtEnd(lx) { LexError(lx, "unfinished string", false); return false }
+            e := lx.src[lx.pos]
+            if e == #char "n" { VecPush(lx.buf, 10); lx.pos += 1 }
+            else if e == #char "t" { VecPush(lx.buf, 9); lx.pos += 1 }
+            else if e == #char "r" { VecPush(lx.buf, 13); lx.pos += 1 }
+            else if e == #char "a" { VecPush(lx.buf, 7); lx.pos += 1 }
+            else if e == #char "b" { VecPush(lx.buf, 8); lx.pos += 1 }
+            else if e == #char "f" { VecPush(lx.buf, 12); lx.pos += 1 }
+            else if e == #char "v" { VecPush(lx.buf, 11); lx.pos += 1 }
+            else if e == 10 || e == 13 { VecPush(lx.buf, 10); SkipNewline(lx) }
+            else if e == #char "x" {
+                // LuaJIT/5.2 hex escape.
+                if lx.pos + 2 < lx.src.count && IsXDigit(lx.src[lx.pos + 1]) && IsXDigit(lx.src[lx.pos + 2]) {
+                    VecPush(lx.buf, cast(u8)(HexDigitValue(lx.src[lx.pos + 1]) * 16 + HexDigitValue(lx.src[lx.pos + 2])))
+                    lx.pos += 3
+                } else {
+                    LexError(lx, "invalid escape sequence", false)
+                    return false
+                }
+            } else if e == #char "z" {
+                // LuaJIT: skip following whitespace.
+                lx.pos += 1
+                while !AtEnd(lx) && IsSpace(lx.src[lx.pos]) {
+                    if lx.src[lx.pos] == 10 || lx.src[lx.pos] == 13 { SkipNewline(lx) } else { lx.pos += 1 }
+                }
+            } else if IsDigit(e) {
+                value: s32 = 0
+                digits: s32 = 0
+                while digits < 3 && !AtEnd(lx) && IsDigit(lx.src[lx.pos]) {
+                    value = value * 10 + cast(s32)(lx.src[lx.pos] - #char "0")
+                    lx.pos += 1
+                    digits += 1
+                }
+                if value > 255 { LexError(lx, "escape sequence too large", false); return false }
+                VecPush(lx.buf, cast(u8) value)
+            } else {
+                // \\, \", \' and any other character stand for themselves.
+                VecPush(lx.buf, e)
+                lx.pos += 1
+            }
+            continue
+        }
+        VecPush(lx.buf, c)
+        lx.pos += 1
+    }
+    return false
+}
+
+HexDigitValue :: (c: u8) -> s32 {
+    if c >= #char "0" && c <= #char "9" { return cast(s32)(c - #char "0") }
+    if c >= #char "a" && c <= #char "f" { return cast(s32)(c - #char "a") + 10 }
+    if c >= #char "A" && c <= #char "F" { return cast(s32)(c - #char "A") + 10 }
+    return -1
+}
+
+ReadNumber :: (lx: *Lexer) -> bool {
+    start := lx.pos
+    if lx.src[lx.pos] == #char "0" && (Peek(lx, 1) == #char "x" || Peek(lx, 1) == #char "X") {
+        lx.pos += 2
+    }
+    while !AtEnd(lx) {
+        c := lx.src[lx.pos]
+        if IsAlnum(c) || c == #char "." {
+            if (c == #char "e" || c == #char "E") && (Peek(lx, 1) == #char "+" || Peek(lx, 1) == #char "-") && !IsHexPrefixed(lx.src, start) {
+                lx.pos += 2
+                continue
+            }
+            if (c == #char "p" || c == #char "P") && (Peek(lx, 1) == #char "+" || Peek(lx, 1) == #char "-") && IsHexPrefixed(lx.src, start) {
+                lx.pos += 2
+                continue
+            }
+            lx.pos += 1
+        } else {
+            break
+        }
+    }
+    value, ok := ParseNumberText(lx.src[start:lx.pos])
+    if !ok {
+        lx.tok.kind = TK_NUMBER
+        VecClear(lx.buf)
+        LexError(lx, "malformed number", false)
+        BuilderAppend(lx.message, " near '")
+        BuilderAppend(lx.message, lx.src[start:lx.pos])
+        VecPush(lx.message, #char "'")
+        return false
+    }
+    lx.tok.num = value
+    return true
+}
+
+IsHexPrefixed :: (src: string, start: s64) -> bool {
+    return start + 1 < src.count && src[start] == #char "0" && (src[start + 1] == #char "x" || src[start + 1] == #char "X")
+}
+
+// Scan the next token into lx.tok.
+Scan :: (lx: *Lexer) {
+    while true {
+        if AtEnd(lx) {
+            lx.tok.kind = TK_EOS
+            lx.tok.line = lx.line
+            return
+        }
+        c := lx.src[lx.pos]
+        lx.tok.line = lx.line
+        if c == 10 || c == 13 { SkipNewline(lx); continue }
+        if IsSpace(c) { lx.pos += 1; continue }
+        if c == #char "-" {
+            if Peek(lx, 1) != #char "-" { lx.pos += 1; lx.tok.kind = #char "-"; return }
+            lx.pos += 2
+            if !AtEnd(lx) && lx.src[lx.pos] == #char "[" {
+                level := LongBracketLevel(lx)
+                if level >= 0 {
+                    if !ReadLongString(lx, level, false) { lx.tok.kind = TK_EOS; return }
+                    continue
+                }
+            }
+            while !AtEnd(lx) && lx.src[lx.pos] != 10 && lx.src[lx.pos] != 13 { lx.pos += 1 }
+            continue
+        }
+        if c == #char "[" {
+            level := LongBracketLevel(lx)
+            if level >= 0 {
+                if !ReadLongString(lx, level, true) { lx.tok.kind = TK_EOS; return }
+                lx.tok.kind = TK_STRING
+                lx.tok.str = InternBytes(lx.L, *lx.buf)
+                return
+            }
+            if level != -1 { LexError(lx, "invalid long string delimiter", false); lx.tok.kind = TK_EOS; return }
+            lx.pos += 1
+            lx.tok.kind = #char "["
+            return
+        }
+        if c == #char "=" {
+            lx.pos += 1
+            if Peek(lx, 0) == #char "=" { lx.pos += 1; lx.tok.kind = TK_EQ } else { lx.tok.kind = #char "=" }
+            return
+        }
+        if c == #char "<" {
+            lx.pos += 1
+            if Peek(lx, 0) == #char "=" { lx.pos += 1; lx.tok.kind = TK_LE } else { lx.tok.kind = #char "<" }
+            return
+        }
+        if c == #char ">" {
+            lx.pos += 1
+            if Peek(lx, 0) == #char "=" { lx.pos += 1; lx.tok.kind = TK_GE } else { lx.tok.kind = #char ">" }
+            return
+        }
+        if c == #char "~" {
+            lx.pos += 1
+            if Peek(lx, 0) == #char "=" { lx.pos += 1; lx.tok.kind = TK_NE } else { lx.tok.kind = #char "~" }
+            return
+        }
+        if c == #char "\"" || c == #char "'" {
+            if !ReadString(lx, c) { lx.tok.kind = TK_EOS; return }
+            lx.tok.kind = TK_STRING
+            lx.tok.str = InternBytes(lx.L, *lx.buf)
+            return
+        }
+        if c == #char "." {
+            if Peek(lx, 1) == #char "." {
+                if Peek(lx, 2) == #char "." { lx.pos += 3; lx.tok.kind = TK_DOTS; return }
+                lx.pos += 2
+                lx.tok.kind = TK_CONCAT
+                return
+            }
+            if !IsDigit(Peek(lx, 1)) { lx.pos += 1; lx.tok.kind = #char "."; return }
+            if !ReadNumber(lx) { lx.tok.kind = TK_EOS; return }
+            lx.tok.kind = TK_NUMBER
+            return
+        }
+        if IsDigit(c) {
+            if !ReadNumber(lx) { lx.tok.kind = TK_EOS; return }
+            lx.tok.kind = TK_NUMBER
+            return
+        }
+        if IsAlpha(c) {
+            start := lx.pos
+            while !AtEnd(lx) && IsAlnum(lx.src[lx.pos]) { lx.pos += 1 }
+            h := Intern(lx.L, lx.src[start:lx.pos])
+            reserved := lx.L.strings[h].reserved
+            if reserved > 0 {
+                lx.tok.kind = 256 + cast(s32) reserved
+            } else {
+                lx.tok.kind = TK_NAME
+                lx.tok.str = h
+            }
+            return
+        }
+        // Single-character token; control characters are rejected.
+        if c < 32 || c >= 127 {
+            lx.pos += 1
+            lx.tok.kind = cast(s32) c
+            LexError(lx, "unexpected symbol", true)
+            lx.tok.kind = TK_EOS
+            return
+        }
+        lx.pos += 1
+        lx.tok.kind = cast(s32) c
+        return
+    }
+}
+
+NextToken :: (lx: *Lexer) {
+    lx.last_line = lx.tok.line
+    if lx.has_ahead {
+        lx.tok = lx.ahead
+        lx.has_ahead = false
+        return
+    }
+    Scan(lx)
+}
+
+LookAhead :: (lx: *Lexer) -> s32 {
+    if !lx.has_ahead {
+        saved := lx.tok
+        Scan(lx)
+        lx.ahead = lx.tok
+        lx.tok = saved
+        lx.has_ahead = true
+    }
+    return lx.ahead.kind
+}

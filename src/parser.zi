@@ -1,0 +1,740 @@
+// Lua 5.1 parser (plus LuaJIT goto/labels) producing a flat AST whose nodes
+// refer to each other by index. Lists are chained through `next`.
+
+#scope_module
+
+E_NIL :: 1;
+E_TRUE :: 2;
+E_FALSE :: 3;
+E_NUMBER :: 4;
+E_STRING :: 5;
+E_VARARG :: 6;
+E_FUNCTION :: 7;
+E_TABLE :: 8;
+E_BINOP :: 9;
+E_UNOP :: 10;
+E_NAME :: 11;
+E_INDEX :: 12;
+E_CALL :: 13;
+E_METHOD :: 14;
+E_PAREN :: 15;
+E_AND :: 16;
+E_OR :: 17;
+F_ITEM :: 18;
+F_PAIR :: 19;
+N_DECL :: 20;
+S_LOCAL :: 30;
+S_ASSIGN :: 31;
+S_CALL :: 32;
+S_DO :: 33;
+S_WHILE :: 34;
+S_REPEAT :: 35;
+S_IF :: 36;
+S_NUMFOR :: 37;
+S_GENFOR :: 38;
+S_FUNCTION :: 39;
+S_LOCALFUNC :: 40;
+S_RETURN :: 41;
+S_BREAK :: 42;
+S_GOTO :: 43;
+S_LABEL :: 44;
+
+// Binary operators.
+OPR_ADD :: 0;
+OPR_SUB :: 1;
+OPR_MUL :: 2;
+OPR_DIV :: 3;
+OPR_MOD :: 4;
+OPR_POW :: 5;
+OPR_CONCAT :: 6;
+OPR_NE :: 7;
+OPR_EQ :: 8;
+OPR_LT :: 9;
+OPR_LE :: 10;
+OPR_GT :: 11;
+OPR_GE :: 12;
+OPR_AND :: 13;
+OPR_OR :: 14;
+OPR_NONE :: 15;
+// Unary operators.
+OPR_MINUS :: 0;
+OPR_NOT :: 1;
+OPR_LEN :: 2;
+
+UNARY_PRIORITY :: 8;
+
+// Exported only because Ziran cannot yet index a Vec of a module-scope
+// record from another #load file; not part of the API.
+#scope_export
+LuaSyntaxNode :: struct {
+    kind: u8
+    op: u8
+    line: s32
+    a: s32
+    b: s32
+    c: s32
+    d: s32
+    e: s32
+    next: s32
+    num: float64
+    str: s32
+}
+#scope_module
+
+Parser :: struct {
+    lx: Lexer
+    nodes: Vec(LuaSyntaxNode)
+    depth: s32
+}
+
+AddNode :: (p: *Parser, kind: u8, line: s32) -> s32 {
+    at := p.nodes.count
+    VecResize(p.nodes, at + 1)
+    p.nodes[at].kind = kind
+    p.nodes[at].line = line
+    p.nodes[at].a = -1
+    p.nodes[at].b = -1
+    p.nodes[at].c = -1
+    p.nodes[at].d = -1
+    p.nodes[at].e = -1
+    p.nodes[at].next = -1
+    p.nodes[at].str = -1
+    return cast(s32) at
+}
+
+Failed :: (p: *Parser) -> bool #inline { return p.lx.failed }
+
+SyntaxError :: (p: *Parser, message: string) { LexError(*p.lx, message, true) }
+
+Check :: (p: *Parser, kind: s32) -> bool {
+    if p.lx.tok.kind != kind {
+        text: Vec(u8)
+        VecPush(text, #char "'")
+        TokenText(kind, *text)
+        BuilderAppend(text, "' expected")
+        SyntaxError(p, BytesView(*text))
+        VecFree(text)
+        return false
+    }
+    return true
+}
+
+Accept :: (p: *Parser, kind: s32) -> bool {
+    if p.lx.tok.kind == kind { NextToken(*p.lx); return true }
+    return false
+}
+
+Expect :: (p: *Parser, kind: s32) -> bool {
+    if !Check(p, kind) { return false }
+    NextToken(*p.lx)
+    return true
+}
+
+// Expect a closing token that matches an opener on another line.
+ExpectMatch :: (p: *Parser, what: s32, who: s32, line: s32) -> bool {
+    if p.lx.tok.kind == what { NextToken(*p.lx); return true }
+    if line == p.lx.line {
+        return Expect(p, what)
+    }
+    text: Vec(u8)
+    VecPush(text, #char "'")
+    TokenText(what, *text)
+    BuilderAppend(text, "' expected (to close '")
+    TokenText(who, *text)
+    BuilderAppend(text, "' at line ")
+    Append(*text, cast(s64) line)
+    VecPush(text, #char ")")
+    SyntaxError(p, BytesView(*text))
+    VecFree(text)
+    return false
+}
+
+ExpectName :: (p: *Parser) -> s32 {
+    if !Check(p, TK_NAME) { return -1 }
+    h := p.lx.tok.str
+    NextToken(*p.lx)
+    return h
+}
+
+BlockFollow :: (kind: s32) -> bool {
+    return kind == TK_ELSE || kind == TK_ELSEIF || kind == TK_END || kind == TK_UNTIL || kind == TK_EOS
+}
+
+// Parse statements until a block terminator; returns the first statement.
+ParseBlock :: (p: *Parser) -> s32 {
+    first: s32 = -1
+    last: s32 = -1
+    p.depth += 1
+    if p.depth > 200 { SyntaxError(p, "chunk has too many syntax levels"); return -1 }
+    while !BlockFollow(p.lx.tok.kind) && !Failed(p) {
+        if p.lx.tok.kind == TK_RETURN {
+            s := ParseReturn(p)
+            if first < 0 { first = s } else { p.nodes[last].next = s }
+            last = s
+            break
+        }
+        if p.lx.tok.kind == TK_BREAK {
+            s := AddNode(p, S_BREAK, p.lx.tok.line)
+            NextToken(*p.lx)
+            Accept(p, #char ";")
+            if first < 0 { first = s } else { p.nodes[last].next = s }
+            last = s
+            // Lua 5.1 requires break to end its block; LuaJIT allows more.
+            continue
+        }
+        s := ParseStatement(p)
+        if s >= 0 {
+            if first < 0 { first = s } else { p.nodes[last].next = s }
+            last = s
+        }
+        Accept(p, #char ";")
+    }
+    p.depth -= 1
+    return first
+}
+
+ParseReturn :: (p: *Parser) -> s32 {
+    s := AddNode(p, S_RETURN, p.lx.tok.line)
+    NextToken(*p.lx)
+    if !BlockFollow(p.lx.tok.kind) && p.lx.tok.kind != #char ";" {
+        p.nodes[s].a = ParseExprList(p)
+    }
+    Accept(p, #char ";")
+    return s
+}
+
+ParseStatement :: (p: *Parser) -> s32 {
+    line := p.lx.tok.line
+    kind := p.lx.tok.kind
+    if kind == TK_IF { return ParseIf(p, line) }
+    if kind == TK_WHILE {
+        NextToken(*p.lx)
+        s := AddNode(p, S_WHILE, line)
+        cond := ParseExpr(p)
+        p.nodes[s].a = cond
+        Expect(p, TK_DO)
+        body := ParseBlock(p)
+        p.nodes[s].b = body
+        ExpectMatch(p, TK_END, TK_WHILE, line)
+        return s
+    }
+    if kind == TK_DO {
+        NextToken(*p.lx)
+        s := AddNode(p, S_DO, line)
+        body := ParseBlock(p)
+        p.nodes[s].a = body
+        ExpectMatch(p, TK_END, TK_DO, line)
+        return s
+    }
+    if kind == TK_FOR { return ParseFor(p, line) }
+    if kind == TK_REPEAT {
+        NextToken(*p.lx)
+        s := AddNode(p, S_REPEAT, line)
+        body := ParseBlock(p)
+        p.nodes[s].a = body
+        ExpectMatch(p, TK_UNTIL, TK_REPEAT, line)
+        cond := ParseExpr(p)
+        p.nodes[s].b = cond
+        return s
+    }
+    if kind == TK_FUNCTION {
+        NextToken(*p.lx)
+        s := AddNode(p, S_FUNCTION, line)
+        // funcname: Name {'.' Name} [':' Name]
+        name := ExpectName(p)
+        if name < 0 { return s }
+        target := AddNode(p, E_NAME, line)
+        p.nodes[target].str = name
+        method := false
+        while p.lx.tok.kind == #char "." || p.lx.tok.kind == #char ":" {
+            is_method := p.lx.tok.kind == #char ":"
+            NextToken(*p.lx)
+            key_name := ExpectName(p)
+            if key_name < 0 { return s }
+            key := AddNode(p, E_STRING, line)
+            p.nodes[key].str = key_name
+            index := AddNode(p, E_INDEX, line)
+            p.nodes[index].a = target
+            p.nodes[index].b = key
+            target = index
+            if is_method { method = true; break }
+        }
+        p.nodes[s].a = target
+        function := ParseFunctionBody(p, method, line)
+        p.nodes[s].b = function
+        return s
+    }
+    if kind == TK_LOCAL {
+        NextToken(*p.lx)
+        if Accept(p, TK_FUNCTION) {
+            s := AddNode(p, S_LOCALFUNC, line)
+            name := ExpectName(p)
+            decl := AddNode(p, N_DECL, line)
+            p.nodes[decl].str = name
+            p.nodes[s].a = decl
+            function := ParseFunctionBody(p, false, line)
+            p.nodes[s].b = function
+            return s
+        }
+        s := AddNode(p, S_LOCAL, line)
+        first: s32 = -1
+        last: s32 = -1
+        while true {
+            name := ExpectName(p)
+            if name < 0 { return s }
+            decl := AddNode(p, N_DECL, line)
+            p.nodes[decl].str = name
+            if first < 0 { first = decl } else { p.nodes[last].next = decl }
+            last = decl
+            if !Accept(p, #char ",") { break }
+        }
+        p.nodes[s].a = first
+        if Accept(p, #char "=") {
+            exprs := ParseExprList(p)
+            p.nodes[s].b = exprs
+        }
+        return s
+    }
+    if kind == #char ":" && LookAhead(*p.lx) == #char ":" {
+        // ::label::
+        NextToken(*p.lx)
+        NextToken(*p.lx)
+        s := AddNode(p, S_LABEL, line)
+        p.nodes[s].str = ExpectName(p)
+        if Expect(p, #char ":") { Expect(p, #char ":") }
+        return s
+    }
+    if kind == TK_NAME && p.lx.tok.str == GotoName(p) && LookAhead(*p.lx) == TK_NAME {
+        NextToken(*p.lx)
+        s := AddNode(p, S_GOTO, line)
+        p.nodes[s].str = ExpectName(p)
+        return s
+    }
+    return ParseExprStatement(p)
+}
+
+GotoName :: (p: *Parser) -> s32 { return p.lx.L.name_goto }
+
+ParseIf :: (p: *Parser, line: s32) -> s32 {
+    // if cond then block {elseif cond then block} [else block] end
+    NextToken(*p.lx)
+    s := AddNode(p, S_IF, line)
+    cond := ParseExpr(p)
+    p.nodes[s].a = cond
+    Expect(p, TK_THEN)
+    body := ParseBlock(p)
+    p.nodes[s].b = body
+    current := s
+    while p.lx.tok.kind == TK_ELSEIF && !Failed(p) {
+        elif_line := p.lx.tok.line
+        NextToken(*p.lx)
+        branch := AddNode(p, S_IF, elif_line)
+        branch_cond := ParseExpr(p)
+        p.nodes[branch].a = branch_cond
+        Expect(p, TK_THEN)
+        branch_body := ParseBlock(p)
+        p.nodes[branch].b = branch_body
+        p.nodes[current].c = branch
+        current = branch
+    }
+    if Accept(p, TK_ELSE) {
+        block := AddNode(p, S_DO, p.lx.tok.line)
+        else_body := ParseBlock(p)
+        p.nodes[block].a = else_body
+        p.nodes[current].c = block
+    }
+    ExpectMatch(p, TK_END, TK_IF, line)
+    return s
+}
+
+ParseFor :: (p: *Parser, line: s32) -> s32 {
+    NextToken(*p.lx)
+    name := ExpectName(p)
+    if name < 0 { return -1 }
+    decl := AddNode(p, N_DECL, line)
+    p.nodes[decl].str = name
+    if p.lx.tok.kind == #char "=" {
+        NextToken(*p.lx)
+        s := AddNode(p, S_NUMFOR, line)
+        p.nodes[s].a = decl
+        start := ParseExpr(p)
+        p.nodes[s].b = start
+        Expect(p, #char ",")
+        limit := ParseExpr(p)
+        p.nodes[s].c = limit
+        if Accept(p, #char ",") {
+            step := ParseExpr(p)
+            p.nodes[s].d = step
+        }
+        Expect(p, TK_DO)
+        body := ParseBlock(p)
+        p.nodes[s].e = body
+        ExpectMatch(p, TK_END, TK_FOR, line)
+        return s
+    }
+    if p.lx.tok.kind == #char "," || p.lx.tok.kind == TK_IN {
+        s := AddNode(p, S_GENFOR, line)
+        last := decl
+        while Accept(p, #char ",") {
+            other := ExpectName(p)
+            if other < 0 { return s }
+            next := AddNode(p, N_DECL, line)
+            p.nodes[next].str = other
+            p.nodes[last].next = next
+            last = next
+        }
+        p.nodes[s].a = decl
+        Expect(p, TK_IN)
+        exprs := ParseExprList(p)
+        p.nodes[s].b = exprs
+        Expect(p, TK_DO)
+        body := ParseBlock(p)
+        p.nodes[s].c = body
+        ExpectMatch(p, TK_END, TK_FOR, line)
+        return s
+    }
+    SyntaxError(p, "'=' or 'in' expected")
+    return -1
+}
+
+ParseExprStatement :: (p: *Parser) -> s32 {
+    line := p.lx.tok.line
+    first := ParseSuffixedExpr(p)
+    if Failed(p) { return -1 }
+    if p.lx.tok.kind == #char "=" || p.lx.tok.kind == #char "," {
+        s := AddNode(p, S_ASSIGN, line)
+        p.nodes[s].a = first
+        last := first
+        if !IsAssignable(p, first) { SyntaxError(p, "syntax error"); return s }
+        while Accept(p, #char ",") {
+            target := ParseSuffixedExpr(p)
+            if Failed(p) { return s }
+            if !IsAssignable(p, target) { SyntaxError(p, "syntax error"); return s }
+            p.nodes[last].next = target
+            last = target
+        }
+        Expect(p, #char "=")
+        exprs := ParseExprList(p)
+        p.nodes[s].b = exprs
+        return s
+    }
+    kind := p.nodes[first].kind
+    if kind != E_CALL && kind != E_METHOD {
+        SyntaxError(p, "syntax error")
+        return -1
+    }
+    s := AddNode(p, S_CALL, line)
+    p.nodes[s].a = first
+    return s
+}
+
+IsAssignable :: (p: *Parser, node: s32) -> bool {
+    kind := p.nodes[node].kind
+    return kind == E_NAME || kind == E_INDEX
+}
+
+ParseExprList :: (p: *Parser) -> s32 {
+    first := ParseExpr(p)
+    last := first
+    while Accept(p, #char ",") && !Failed(p) {
+        next := ParseExpr(p)
+        if last >= 0 { p.nodes[last].next = next }
+        last = next
+    }
+    return first
+}
+
+ParsePrimaryExpr :: (p: *Parser) -> s32 {
+    line := p.lx.tok.line
+    if p.lx.tok.kind == TK_NAME {
+        node := AddNode(p, E_NAME, line)
+        p.nodes[node].str = p.lx.tok.str
+        NextToken(*p.lx)
+        return node
+    }
+    if p.lx.tok.kind == #char "(" {
+        NextToken(*p.lx)
+        inner := ParseExpr(p)
+        ExpectMatch(p, #char ")", #char "(", line)
+        node := AddNode(p, E_PAREN, line)
+        p.nodes[node].a = inner
+        return node
+    }
+    SyntaxError(p, "unexpected symbol")
+    return -1
+}
+
+ParseSuffixedExpr :: (p: *Parser) -> s32 {
+    expr := ParsePrimaryExpr(p)
+    while !Failed(p) {
+        kind := p.lx.tok.kind
+        line := p.lx.tok.line
+        if kind == #char "." {
+            NextToken(*p.lx)
+            name := ExpectName(p)
+            key := AddNode(p, E_STRING, line)
+            p.nodes[key].str = name
+            index := AddNode(p, E_INDEX, line)
+            p.nodes[index].a = expr
+            p.nodes[index].b = key
+            expr = index
+        } else if kind == #char "[" {
+            NextToken(*p.lx)
+            key := ParseExpr(p)
+            Expect(p, #char "]")
+            index := AddNode(p, E_INDEX, line)
+            p.nodes[index].a = expr
+            p.nodes[index].b = key
+            expr = index
+        } else if kind == #char ":" {
+            if LookAhead(*p.lx) == #char ":" { return expr }
+            NextToken(*p.lx)
+            name := ExpectName(p)
+            call := AddNode(p, E_METHOD, line)
+            p.nodes[call].a = expr
+            p.nodes[call].str = name
+            args := ParseCallArgs(p, line)
+            p.nodes[call].b = args
+            expr = call
+        } else if kind == #char "(" || kind == TK_STRING || kind == #char "{" {
+            call := AddNode(p, E_CALL, line)
+            p.nodes[call].a = expr
+            args := ParseCallArgs(p, line)
+            p.nodes[call].b = args
+            expr = call
+        } else {
+            return expr
+        }
+    }
+    return expr
+}
+
+ParseCallArgs :: (p: *Parser, line: s32) -> s32 {
+    kind := p.lx.tok.kind
+    if kind == TK_STRING {
+        node := AddNode(p, E_STRING, p.lx.tok.line)
+        p.nodes[node].str = p.lx.tok.str
+        NextToken(*p.lx)
+        return node
+    }
+    if kind == #char "{" { return ParseTable(p) }
+    if kind != #char "(" { SyntaxError(p, "function arguments expected"); return -1 }
+    if line != p.lx.tok.line {
+        SyntaxError(p, "ambiguous syntax (function call x new statement)")
+        return -1
+    }
+    NextToken(*p.lx)
+    if p.lx.tok.kind == #char ")" { NextToken(*p.lx); return -1 }
+    args := ParseExprList(p)
+    ExpectMatch(p, #char ")", #char "(", line)
+    return args
+}
+
+ParseTable :: (p: *Parser) -> s32 {
+    line := p.lx.tok.line
+    table := AddNode(p, E_TABLE, line)
+    Expect(p, #char "{")
+    first: s32 = -1
+    last: s32 = -1
+    while p.lx.tok.kind != #char "}" && !Failed(p) {
+        field: s32 = -1
+        if p.lx.tok.kind == TK_NAME && LookAhead(*p.lx) == #char "=" {
+            field = AddNode(p, F_PAIR, p.lx.tok.line)
+            key := AddNode(p, E_STRING, p.lx.tok.line)
+            p.nodes[key].str = p.lx.tok.str
+            NextToken(*p.lx)
+            NextToken(*p.lx)
+            value := ParseExpr(p)
+            p.nodes[field].a = key
+            p.nodes[field].b = value
+        } else if p.lx.tok.kind == #char "[" {
+            field = AddNode(p, F_PAIR, p.lx.tok.line)
+            NextToken(*p.lx)
+            key := ParseExpr(p)
+            Expect(p, #char "]")
+            Expect(p, #char "=")
+            value := ParseExpr(p)
+            p.nodes[field].a = key
+            p.nodes[field].b = value
+        } else {
+            field = AddNode(p, F_ITEM, p.lx.tok.line)
+            value := ParseExpr(p)
+            p.nodes[field].a = value
+        }
+        if first < 0 { first = field } else { p.nodes[last].next = field }
+        last = field
+        if !Accept(p, #char ",") && !Accept(p, #char ";") { break }
+    }
+    ExpectMatch(p, #char "}", #char "{", line)
+    p.nodes[table].a = first
+    return table
+}
+
+// function body: (params) block end. Returns an E_FUNCTION node with
+// a = first parameter decl, b = body, c = 1 when vararg, e = end line.
+ParseFunctionBody :: (p: *Parser, method: bool, line: s32) -> s32 {
+    node := AddNode(p, E_FUNCTION, line)
+    first: s32 = -1
+    last: s32 = -1
+    if method {
+        self := AddNode(p, N_DECL, line)
+        p.nodes[self].str = Intern(p.lx.L, "self")
+        first = self
+        last = self
+    }
+    p.nodes[node].c = 0
+    Expect(p, #char "(")
+    if p.lx.tok.kind != #char ")" {
+        while !Failed(p) {
+            if p.lx.tok.kind == TK_DOTS {
+                NextToken(*p.lx)
+                p.nodes[node].c = 1
+                break
+            }
+            name := ExpectName(p)
+            if name < 0 { return node }
+            decl := AddNode(p, N_DECL, line)
+            p.nodes[decl].str = name
+            if first < 0 { first = decl } else { p.nodes[last].next = decl }
+            last = decl
+            if !Accept(p, #char ",") { break }
+        }
+    }
+    Expect(p, #char ")")
+    body := ParseBlock(p)
+    p.nodes[node].a = first
+    p.nodes[node].b = body
+    p.nodes[node].e = p.lx.tok.line
+    ExpectMatch(p, TK_END, TK_FUNCTION, line)
+    return node
+}
+
+ParseSimpleExpr :: (p: *Parser) -> s32 {
+    line := p.lx.tok.line
+    kind := p.lx.tok.kind
+    if kind == TK_NUMBER {
+        node := AddNode(p, E_NUMBER, line)
+        p.nodes[node].num = p.lx.tok.num
+        NextToken(*p.lx)
+        return node
+    }
+    if kind == TK_STRING {
+        node := AddNode(p, E_STRING, line)
+        p.nodes[node].str = p.lx.tok.str
+        NextToken(*p.lx)
+        return node
+    }
+    if kind == TK_NIL { NextToken(*p.lx); return AddNode(p, E_NIL, line) }
+    if kind == TK_TRUE { NextToken(*p.lx); return AddNode(p, E_TRUE, line) }
+    if kind == TK_FALSE { NextToken(*p.lx); return AddNode(p, E_FALSE, line) }
+    if kind == TK_DOTS { NextToken(*p.lx); return AddNode(p, E_VARARG, line) }
+    if kind == #char "{" { return ParseTable(p) }
+    if kind == TK_FUNCTION {
+        NextToken(*p.lx)
+        return ParseFunctionBody(p, false, line)
+    }
+    return ParseSuffixedExpr(p)
+}
+
+BinaryOperator :: (kind: s32) -> s32 {
+    if kind == #char "+" { return OPR_ADD }
+    if kind == #char "-" { return OPR_SUB }
+    if kind == #char "*" { return OPR_MUL }
+    if kind == #char "/" { return OPR_DIV }
+    if kind == #char "%" { return OPR_MOD }
+    if kind == #char "^" { return OPR_POW }
+    if kind == TK_CONCAT { return OPR_CONCAT }
+    if kind == TK_NE { return OPR_NE }
+    if kind == TK_EQ { return OPR_EQ }
+    if kind == #char "<" { return OPR_LT }
+    if kind == TK_LE { return OPR_LE }
+    if kind == #char ">" { return OPR_GT }
+    if kind == TK_GE { return OPR_GE }
+    if kind == TK_AND { return OPR_AND }
+    if kind == TK_OR { return OPR_OR }
+    return OPR_NONE
+}
+
+LeftPriority :: (op: s32) -> s32 {
+    if op <= OPR_SUB { return 6 }
+    if op <= OPR_MOD { return 7 }
+    if op == OPR_POW { return 10 }
+    if op == OPR_CONCAT { return 5 }
+    if op <= OPR_GE { return 3 }
+    if op == OPR_AND { return 2 }
+    return 1
+}
+
+RightPriority :: (op: s32) -> s32 {
+    if op == OPR_POW { return 9 }
+    if op == OPR_CONCAT { return 4 }
+    return LeftPriority(op)
+}
+
+ParseExpr :: (p: *Parser) -> s32 { return ParseSubExpr(p, 0) }
+
+// subexpr -> (simpleexp | unop subexpr) { binop subexpr }, folding numbers.
+ParseSubExpr :: (p: *Parser, limit: s32) -> s32 {
+    p.depth += 1
+    if p.depth > 200 { SyntaxError(p, "chunk has too many syntax levels"); return -1 }
+    left: s32 = -1
+    line := p.lx.tok.line
+    kind := p.lx.tok.kind
+    if kind == TK_NOT || kind == #char "-" || kind == #char "#" {
+        NextToken(*p.lx)
+        operand := ParseSubExpr(p, UNARY_PRIORITY)
+        if Failed(p) { p.depth -= 1; return -1 }
+        op: s32 = ifx kind == TK_NOT then OPR_NOT else (ifx kind == #char "-" then OPR_MINUS else OPR_LEN)
+        if op == OPR_MINUS && p.nodes[operand].kind == E_NUMBER {
+            p.nodes[operand].num = -p.nodes[operand].num
+            left = operand
+        } else {
+            left = AddNode(p, E_UNOP, line)
+            p.nodes[left].op = cast(u8) op
+            p.nodes[left].a = operand
+        }
+    } else {
+        left = ParseSimpleExpr(p)
+    }
+    while !Failed(p) {
+        op := BinaryOperator(p.lx.tok.kind)
+        if op == OPR_NONE || LeftPriority(op) <= limit { break }
+        op_line := p.lx.tok.line
+        NextToken(*p.lx)
+        right := ParseSubExpr(p, RightPriority(op))
+        if Failed(p) { break }
+        folded := FoldConstant(p, op, left, right)
+        if folded >= 0 { left = folded; continue }
+        node: s32
+        if op == OPR_AND {
+            node = AddNode(p, E_AND, op_line)
+        } else if op == OPR_OR {
+            node = AddNode(p, E_OR, op_line)
+        } else {
+            node = AddNode(p, E_BINOP, op_line)
+            p.nodes[node].op = cast(u8) op
+        }
+        p.nodes[node].a = left
+        p.nodes[node].b = right
+        left = node
+    }
+    p.depth -= 1
+    return left
+}
+
+FoldConstant :: (p: *Parser, op: s32, left: s32, right: s32) -> s32 {
+    if op > OPR_POW { return -1 }
+    if p.nodes[left].kind != E_NUMBER || p.nodes[right].kind != E_NUMBER { return -1 }
+    a := p.nodes[left].num
+    b := p.nodes[right].num
+    r: float64
+    if op == OPR_ADD { r = a + b }
+    else if op == OPR_SUB { r = a - b }
+    else if op == OPR_MUL { r = a * b }
+    else if op == OPR_DIV { if b == 0.0 { return -1 } r = a / b }
+    else if op == OPR_MOD { if b == 0.0 { return -1 } r = LuaMod(a, b) }
+    else { r = LuaPow(a, b) }
+    if r != r { return -1 }
+    p.nodes[left].num = r
+    return left
+}

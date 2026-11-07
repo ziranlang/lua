@@ -1,0 +1,743 @@
+// Base library, coroutines and a minimal package/require.
+
+#scope_module
+
+SetNative :: (L: *LuaState, t: s32, name: string, fn: LuaNative) -> s32 {
+    h := NewNative(L, fn, name)
+    SetStr(L, t, Intern(L, name), FunctionValue(h))
+    return h
+}
+
+SetValue :: (L: *LuaState, t: s32, name: string, v: LuaValue) {
+    SetStr(L, t, Intern(L, name), v)
+}
+
+Slot1 :: (L: *LuaState) -> s64 #inline { return StackBase(L) }
+
+ReturnValue :: (L: *LuaState, v: LuaValue) -> s32 #inline {
+    Push(L, v)
+    return 1
+}
+
+ReturnNil :: (L: *LuaState) -> s32 #inline {
+    Push(L, NilValue())
+    return 1
+}
+
+// Push nil, message: the failure convention of load/io functions.
+ReturnFailure :: (L: *LuaState, message: string) -> s32 {
+    Push(L, NilValue())
+    Push(L, StringValue(Intern(L, message)))
+    return 2
+}
+
+EmitText :: (L: *LuaState, text: string) {
+    if L.print_sink_set {
+        sink := L.print_sink
+        sink(L.print_context, text)
+    } else {
+        print("%", text)
+    }
+}
+
+BasePrint :: (L: *LuaState) -> s32 {
+    n := ArgCount(L)
+    out: Vec(u8)
+    i: s32 = 1
+    while i <= n {
+        s: LuaValue
+        if !ToStringMeta(L, Arg(L, i), *s) { VecFree(out); return LUA_NATIVE_ERROR }
+        if !IsStringLike(s) {
+            VecFree(out)
+            return LuaErrorText(L, "'tostring' must return a string to 'print'")
+        }
+        if i > 1 { VecPush(out, 9) }
+        if s.t == LUA_TSTRING { BuilderAppend(out, StrView(L, s.h)) } else { AppendNumber(*out, s.n) }
+        i += 1
+    }
+    VecPush(out, 10)
+    EmitText(L, BytesView(*out))
+    VecFree(out)
+    return 0
+}
+
+BaseType :: (L: *LuaState) -> s32 {
+    if ArgCount(L) < 1 { return LuaArgError(L, 1, "value expected") }
+    return ReturnValue(L, StringValue(Intern(L, TypeNameOf(Arg(L, 1).t))))
+}
+
+BaseToString :: (L: *LuaState) -> s32 {
+    if ArgCount(L) < 1 { return LuaArgError(L, 1, "value expected") }
+    s: LuaValue
+    if !ToStringMeta(L, Arg(L, 1), *s) { return LUA_NATIVE_ERROR }
+    return ReturnValue(L, s)
+}
+
+DigitValue :: (c: u8) -> s32 {
+    if c >= #char "0" && c <= #char "9" { return cast(s32)(c - #char "0") }
+    if c >= #char "a" && c <= #char "z" { return cast(s32)(c - #char "a") + 10 }
+    if c >= #char "A" && c <= #char "Z" { return cast(s32)(c - #char "A") + 10 }
+    return 99
+}
+
+BaseToNumber :: (L: *LuaState) -> s32 {
+    base, ok := LuaOptInteger(L, 2, 10)
+    if !ok { return LUA_NATIVE_ERROR }
+    v := Arg(L, 1)
+    if base == 10 {
+        if ArgCount(L) < 1 { return LuaArgError(L, 1, "value expected") }
+        n, converted := ToNumber(L, v)
+        if converted { return ReturnValue(L, NumberValue(n)) }
+        return ReturnNil(L)
+    }
+    text, is_text := LuaCheckString(L, 1)
+    if !is_text { return LUA_NATIVE_ERROR }
+    if base < 2 || base > 36 { return LuaArgError(L, 2, "base out of range") }
+    at: s64 = 0
+    while at < text.count && IsWhitespaceByte(text[at]) { at += 1 }
+    negative := false
+    if at < text.count && (text[at] == #char "-" || text[at] == #char "+") {
+        negative = text[at] == #char "-"
+        at += 1
+    }
+    if base == 16 && at + 1 < text.count && text[at] == #char "0" && (text[at + 1] == #char "x" || text[at + 1] == #char "X") { at += 2 }
+    value: float64 = 0.0
+    digits: s64 = 0
+    while at < text.count {
+        d := DigitValue(text[at])
+        if d >= base { break }
+        value = value * cast(float64) base + cast(float64) d
+        digits += 1
+        at += 1
+    }
+    while at < text.count && IsWhitespaceByte(text[at]) { at += 1 }
+    if digits == 0 || at != text.count { return ReturnNil(L) }
+    return ReturnValue(L, NumberValue(ifx negative then -value else value))
+}
+
+BaseNext :: (L: *LuaState) -> s32 {
+    if !LuaCheckTable(L, 1) { return LUA_NATIVE_ERROR }
+    k: LuaValue
+    v: LuaValue
+    found, ok := TableNext(L, Arg(L, 1).h, Arg(L, 2), *k, *v)
+    if !ok { return LuaErrorText(L, "invalid key to 'next'") }
+    if !found { return ReturnNil(L) }
+    Push(L, k)
+    Push(L, v)
+    return 2
+}
+
+BasePairs :: (L: *LuaState) -> s32 {
+    if !LuaCheckTable(L, 1) { return LUA_NATIVE_ERROR }
+    t := Arg(L, 1)
+    Push(L, FunctionValue(L.next_fn))
+    Push(L, t)
+    Push(L, NilValue())
+    return 3
+}
+
+BaseInext :: (L: *LuaState) -> s32 {
+    if !LuaCheckTable(L, 1) { return LUA_NATIVE_ERROR }
+    index, ok := LuaCheckInteger(L, 2)
+    if !ok { return LUA_NATIVE_ERROR }
+    index += 1
+    v := GetInt(L, Arg(L, 1).h, index)
+    if v.t == LUA_TNIL { return 0 }
+    Push(L, NumberValue(cast(float64) index))
+    Push(L, v)
+    return 2
+}
+
+BaseIpairs :: (L: *LuaState) -> s32 {
+    if !LuaCheckTable(L, 1) { return LUA_NATIVE_ERROR }
+    t := Arg(L, 1)
+    Push(L, FunctionValue(L.inext_fn))
+    Push(L, t)
+    Push(L, NumberValue(0.0))
+    return 3
+}
+
+BaseRawGet :: (L: *LuaState) -> s32 {
+    if !LuaCheckTable(L, 1) { return LUA_NATIVE_ERROR }
+    return ReturnValue(L, RawGet(L, Arg(L, 1).h, Arg(L, 2)))
+}
+
+BaseRawSet :: (L: *LuaState) -> s32 {
+    if !LuaCheckTable(L, 1) { return LUA_NATIVE_ERROR }
+    if !LuaCheckAny(L, 3) { return LUA_NATIVE_ERROR }
+    key := Arg(L, 2)
+    if key.t == LUA_TNIL { return LuaErrorText(L, "table index is nil") }
+    if key.t == LUA_TNUMBER && key.n != key.n { return LuaErrorText(L, "table index is NaN") }
+    t := Arg(L, 1)
+    RawSet(L, t.h, key, Arg(L, 3))
+    return ReturnValue(L, t)
+}
+
+BaseRawEqual :: (L: *LuaState) -> s32 {
+    if !LuaCheckAny(L, 1) || !LuaCheckAny(L, 2) { return LUA_NATIVE_ERROR }
+    return ReturnValue(L, BoolValue(RawEqual(Arg(L, 1), Arg(L, 2))))
+}
+
+BaseGetMetatable :: (L: *LuaState) -> s32 {
+    if !LuaCheckAny(L, 1) { return LUA_NATIVE_ERROR }
+    mt := MetatableOf(L, Arg(L, 1))
+    if mt < 0 { return ReturnNil(L) }
+    protected := GetStr(L, mt, L.tm_names[TM_METATABLE])
+    if protected.t != LUA_TNIL { return ReturnValue(L, protected) }
+    return ReturnValue(L, TableValue(mt))
+}
+
+BaseSetMetatable :: (L: *LuaState) -> s32 {
+    if !LuaCheckTable(L, 1) { return LUA_NATIVE_ERROR }
+    t := Arg(L, 1)
+    mt := Arg(L, 2)
+    if mt.t != LUA_TNIL && mt.t != LUA_TTABLE { return LuaArgError(L, 2, "nil or table expected") }
+    old := L.tables[t.h].meta
+    if old >= 0 && GetStr(L, old, L.tm_names[TM_METATABLE]).t != LUA_TNIL {
+        return LuaErrorText(L, "cannot change a protected metatable")
+    }
+    L.tables[t.h].meta = ifx mt.t == LUA_TTABLE then mt.h else -1
+    return ReturnValue(L, t)
+}
+
+BaseAssert :: (L: *LuaState) -> s32 {
+    if !LuaCheckAny(L, 1) { return LUA_NATIVE_ERROR }
+    if Truthy(Arg(L, 1)) { return ArgCount(L) }
+    if ArgCount(L) < 2 { return LuaErrorText(L, "assertion failed!") }
+    message := Arg(L, 2)
+    if message.t == LUA_TSTRING { return LuaErrorText(L, StrView(L, message.h)) }
+    if message.t == LUA_TNUMBER {
+        h, ok := ToStringHandle(L, message)
+        return LuaErrorText(L, StrView(L, h))
+    }
+    SetError(L, message)
+    return LUA_NATIVE_ERROR
+}
+
+BaseError :: (L: *LuaState) -> s32 {
+    level, ok := LuaOptInteger(L, 2, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    v := Arg(L, 1)
+    // LuaJIT adds the position only to string messages; numbers stay numbers.
+    if v.t == LUA_TSTRING && level > 0 {
+        h := v.h
+        text: Vec(u8)
+        AppendWhere(L, *text, cast(s32) level)
+        BuilderAppend(text, StrView(L, h))
+        v = StringValue(InternBytes(L, *text))
+        VecFree(text)
+    }
+    SetError(L, v)
+    return LUA_NATIVE_ERROR
+}
+
+// pcall(f, ...) -> true, results | false, error
+BasePcall :: (L: *LuaState) -> s32 {
+    if ArgCount(L) < 1 { return LuaArgError(L, 1, "value expected") }
+    th := L.cur
+    func := Slot1(L)
+    nargs := ArgCount(L) - 1
+    status := ProtectedCall(L, func, nargs, LUA_MULTRET, NilValue())
+    if status == LUA_OK {
+        n := L.threads[th].top - func
+        Push(L, NilValue())
+        i := L.threads[th].top - 1
+        while i > func {
+            L.threads[th].stack[i] = L.threads[th].stack[i - 1]
+            i -= 1
+        }
+        L.threads[th].stack[func] = BoolValue(true)
+        return cast(s32)(n + 1)
+    }
+    L.threads[th].top = func
+    Push(L, BoolValue(false))
+    Push(L, L.error)
+    L.error = NilValue()
+    return 2
+}
+
+// xpcall(f, handler, ...) -> true, results | false, handler(error)
+BaseXpcall :: (L: *LuaState) -> s32 {
+    if ArgCount(L) < 2 { return LuaArgError(L, 2, "value expected") }
+    th := L.cur
+    func := Slot1(L)
+    handler := L.threads[th].stack[func + 1]
+    // Drop the handler from the argument list; the handler entry keeps it alive.
+    i := func + 1
+    while i + 1 < L.threads[th].top {
+        L.threads[th].stack[i] = L.threads[th].stack[i + 1]
+        i += 1
+    }
+    L.threads[th].top -= 1
+    nargs := cast(s32)(L.threads[th].top - func - 1)
+    status := ProtectedCall(L, func, nargs, LUA_MULTRET, handler)
+    if status == LUA_OK {
+        n := L.threads[th].top - func
+        Push(L, NilValue())
+        j := L.threads[th].top - 1
+        while j > func {
+            L.threads[th].stack[j] = L.threads[th].stack[j - 1]
+            j -= 1
+        }
+        L.threads[th].stack[func] = BoolValue(true)
+        return cast(s32)(n + 1)
+    }
+    L.threads[th].top = func
+    Push(L, BoolValue(false))
+    Push(L, L.error)
+    L.error = NilValue()
+    return 2
+}
+
+BaseSelect :: (L: *LuaState) -> s32 {
+    n := ArgCount(L)
+    first := Arg(L, 1)
+    if first.t == LUA_TSTRING && StrLen(L, first.h) == 1 && L.strings[first.h].bytes[0] == #char "#" {
+        return ReturnValue(L, NumberValue(cast(float64)(n - 1)))
+    }
+    i, ok := LuaCheckInteger(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    if i < 0 { i = n + i } else if i > n { i = n }
+    if i < 1 { return LuaArgError(L, 1, "index out of range") }
+    return cast(s32)(n - i)
+}
+
+BaseUnpack :: (L: *LuaState) -> s32 {
+    if !LuaCheckTable(L, 1) { return LUA_NATIVE_ERROR }
+    t := Arg(L, 1).h
+    first, ok1 := LuaOptInteger(L, 2, 1)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    last: s64 = 0
+    if Arg(L, 3).t == LUA_TNIL {
+        last = TableLength(L, t)
+    } else {
+        value, ok2 := LuaCheckInteger(L, 3)
+        if !ok2 { return LUA_NATIVE_ERROR }
+        last = value
+    }
+    if first > last { return 0 }
+    count := last - first + 1
+    if count >= 8000000 || !EnsureStack(L, Top(L) + count + 1) { return LuaErrorText(L, "too many results to unpack") }
+    i := first
+    while i <= last {
+        Push(L, GetInt(L, t, i))
+        i += 1
+    }
+    return cast(s32) count
+}
+
+// Gather a chunk from a reader function into bytes.
+ReadChunkPieces :: (L: *LuaState, out: *Vec(u8)) -> bool {
+    th := L.cur
+    reader := Arg(L, 1)
+    while true {
+        top := L.threads[th].top
+        Push(L, reader)
+        if !CallValue(L, top, 0, 1) { return false }
+        piece := L.threads[th].stack[top]
+        L.threads[th].top = top
+        if piece.t == LUA_TNIL { return true }
+        if piece.t != LUA_TSTRING { return ErrorText(L, "reader function must return a string") }
+        if StrLen(L, piece.h) == 0 { return true }
+        BuilderAppend(<<out, StrView(L, piece.h))
+    }
+    return true
+}
+
+LoadResult :: (L: *LuaState, status: s32, env: LuaValue) -> s32 {
+    if status != LUA_OK {
+        message := PopValue(L)
+        Push(L, NilValue())
+        Push(L, message)
+        return 2
+    }
+    if env.t == LUA_TTABLE {
+        f := PopValue(L)
+        L.closures[f.h].env = env.h
+        Push(L, f)
+    }
+    return 1
+}
+
+BaseLoad :: (L: *LuaState) -> s32 {
+    chunk := Arg(L, 1)
+    env := Arg(L, 4)
+    if chunk.t == LUA_TSTRING || chunk.t == LUA_TNUMBER {
+        text, ok := LuaCheckString(L, 1)
+        name, ok2 := LuaOptString(L, 2, text)
+        if !ok2 { return LUA_NATIVE_ERROR }
+        status := LoadChunk(L, text, name, -1)
+        return LoadResult(L, status, env)
+    }
+    if chunk.t != LUA_TFUNCTION { return LuaTypeError(L, 1, "function") }
+    name, ok := LuaOptString(L, 2, "=(load)")
+    if !ok { return LUA_NATIVE_ERROR }
+    name_handle := Intern(L, name)
+    bytes: Vec(u8)
+    if !ReadChunkPieces(L, *bytes) {
+        VecFree(bytes)
+        message := L.error
+        L.error = NilValue()
+        Push(L, NilValue())
+        Push(L, message)
+        return 2
+    }
+    status := LoadChunk(L, BytesView(*bytes), StrView(L, name_handle), -1)
+    VecFree(bytes)
+    return LoadResult(L, status, env)
+}
+
+BaseLoadString :: (L: *LuaState) -> s32 {
+    text, ok := LuaCheckString(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    name, ok2 := LuaOptString(L, 2, text)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    status := LoadChunk(L, text, name, -1)
+    return LoadResult(L, status, NilValue())
+}
+
+// A path inside the file root; false when files are disabled or the path
+// leaves the root.
+ResolvePath :: (L: *LuaState, path: string, out: *Vec(u8)) -> bool {
+    if L.file_root.count == 0 { return false }
+    i: s64 = 0
+    while i + 1 < path.count {
+        if path[i] == #char "." && path[i + 1] == #char "." {
+            before := i == 0 || path[i - 1] == #char "/"
+            after := i + 2 >= path.count || path[i + 2] == #char "/"
+            if before && after { return false }
+        }
+        i += 1
+    }
+    root := BytesView(*L.file_root)
+    if path.count > 0 && path[0] == #char "/" {
+        if path.count < root.count || path[0:root.count] != root { return false }
+        BuilderAppend(<<out, path)
+        return true
+    }
+    BuilderAppend(<<out, root)
+    if root.count > 0 && root[root.count - 1] != #char "/" { VecPush(<<out, #char "/") }
+    BuilderAppend(<<out, path)
+    return true
+}
+
+LoadFileChunk :: (L: *LuaState, path: string) -> s32 {
+    full: Vec(u8)
+    if !ResolvePath(L, path, *full) {
+        VecFree(full)
+        text: Vec(u8)
+        BuilderAppend(text, "cannot open ")
+        BuilderAppend(text, path)
+        Push(L, StringValue(InternBytes(L, *text)))
+        VecFree(text)
+        return LUA_ERRFILE
+    }
+    bytes: Vec(u8)
+    if !ReadFileInto(BytesView(*full), *bytes) {
+        VecFree(bytes)
+        VecFree(full)
+        text: Vec(u8)
+        BuilderAppend(text, "cannot open ")
+        BuilderAppend(text, path)
+        Push(L, StringValue(InternBytes(L, *text)))
+        VecFree(text)
+        return LUA_ERRFILE
+    }
+    name: Vec(u8)
+    VecPush(name, #char "@")
+    BuilderAppend(name, path)
+    status := LoadChunk(L, BytesView(*bytes), BytesView(*name), -1)
+    VecFree(name)
+    VecFree(bytes)
+    VecFree(full)
+    return status
+}
+
+BaseLoadFile :: (L: *LuaState) -> s32 {
+    path, ok := LuaCheckString(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return LoadResult(L, LoadFileChunk(L, path), NilValue())
+}
+
+BaseDoFile :: (L: *LuaState) -> s32 {
+    path, ok := LuaCheckString(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    th := L.cur
+    func := L.threads[th].top
+    if LoadFileChunk(L, path) != LUA_OK { return LuaRaiseError(L) }
+    if !CallValue(L, func, 0, LUA_MULTRET) { return LUA_NATIVE_ERROR }
+    return cast(s32)(L.threads[th].top - func)
+}
+
+// The closure at call level `level` (1 = the caller of the native), or -1.
+LevelClosure :: (L: *LuaState, level: s64) -> s32 {
+    th := L.cur
+    frame := L.threads[th].frames.count - 1 - level
+    if frame < 0 { return -2 }
+    return L.threads[th].frames[frame].closure
+}
+
+BaseGetFenv :: (L: *LuaState) -> s32 {
+    v := Arg(L, 1)
+    if v.t == LUA_TFUNCTION {
+        return ReturnValue(L, TableValue(L.closures[v.h].env))
+    }
+    level, ok := LuaOptInteger(L, 1, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    if level < 0 { return LuaArgError(L, 1, "level must be non-negative") }
+    if level == 0 { return ReturnValue(L, TableValue(L.threads[L.cur].env)) }
+    cl := LevelClosure(L, level)
+    if cl == -2 { return LuaArgError(L, 1, "invalid level") }
+    if L.closures[cl].proto < 0 { return ReturnValue(L, TableValue(L.threads[L.cur].env)) }
+    return ReturnValue(L, TableValue(L.closures[cl].env))
+}
+
+BaseSetFenv :: (L: *LuaState) -> s32 {
+    env := Arg(L, 2)
+    if env.t != LUA_TTABLE { return LuaTypeError(L, 2, "table") }
+    v := Arg(L, 1)
+    if v.t == LUA_TFUNCTION {
+        if L.closures[v.h].proto < 0 { return LuaErrorText(L, "'setfenv' cannot change environment of given object") }
+        L.closures[v.h].env = env.h
+        return ReturnValue(L, v)
+    }
+    level, ok := LuaCheckInteger(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    if level < 0 { return LuaArgError(L, 1, "level must be non-negative") }
+    if level == 0 {
+        L.threads[L.cur].env = env.h
+        return 0
+    }
+    cl := LevelClosure(L, level)
+    if cl == -2 { return LuaArgError(L, 1, "invalid level") }
+    if L.closures[cl].proto < 0 { return LuaErrorText(L, "'setfenv' cannot change environment of given object") }
+    L.closures[cl].env = env.h
+    return ReturnValue(L, FunctionValue(cl))
+}
+
+BaseCollectGarbage :: (L: *LuaState) -> s32 {
+    option, ok := LuaOptString(L, 1, "collect")
+    if !ok { return LUA_NATIVE_ERROR }
+    if option == "count" {
+        Push(L, NumberValue(cast(float64) L.allocated / 1024.0))
+        Push(L, NumberValue(cast(float64)(L.allocated % 1024)))
+        return 2
+    }
+    if option == "collect" || option == "step" {
+        if !L.collecting { CollectGarbage(L) }
+        if option == "step" { return ReturnValue(L, BoolValue(true)) }
+        return ReturnValue(L, NumberValue(0.0))
+    }
+    if option == "stop" { L.threshold = 9223372036854775807; return ReturnValue(L, NumberValue(0.0)) }
+    if option == "restart" { L.threshold = L.allocated * 2; return ReturnValue(L, NumberValue(0.0)) }
+    if option == "setpause" || option == "setstepmul" { return ReturnValue(L, NumberValue(200.0)) }
+    return LuaArgError(L, 1, "invalid option")
+}
+
+BaseGcInfo :: (L: *LuaState) -> s32 {
+    return ReturnValue(L, NumberValue(cast(float64)(L.allocated / 1024)))
+}
+
+BaseNewProxy :: (L: *LuaState) -> s32 {
+    h := NewUserdataObject(L)
+    v := Arg(L, 1)
+    if v.t == LUA_TTRUE {
+        L.userdata[h].meta = NewTable(L, 0, 0)
+    } else if v.t == LUA_TUSERDATA {
+        L.userdata[h].meta = L.userdata[v.h].meta
+    } else if v.t != LUA_TNIL && v.t != LUA_TFALSE {
+        return LuaArgError(L, 1, "boolean or proxy expected")
+    }
+    return ReturnValue(L, ObjectValue(LUA_TUSERDATA, h))
+}
+
+PackageTable :: (L: *LuaState, name: string) -> s32 {
+    package := GetStr(L, L.globals, Intern(L, "package"))
+    if package.t != LUA_TTABLE { return -1 }
+    t := GetStr(L, package.h, Intern(L, name))
+    if t.t != LUA_TTABLE { return -1 }
+    return t.h
+}
+
+BaseRequire :: (L: *LuaState) -> s32 {
+    name, ok := LuaCheckString(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    key := Intern(L, name)
+    loaded := PackageTable(L, "loaded")
+    if loaded >= 0 {
+        v := GetStr(L, loaded, key)
+        if Truthy(v) { return ReturnValue(L, v) }
+    }
+    preload := PackageTable(L, "preload")
+    loader := NilValue()
+    if preload >= 0 { loader = GetStr(L, preload, key) }
+    if loader.t == LUA_TNIL {
+        text: Vec(u8)
+        BuilderAppend(text, "module '")
+        BuilderAppend(text, StrView(L, key))
+        BuilderAppend(text, "' not found")
+        result := LuaErrorText(L, BytesView(*text))
+        VecFree(text)
+        return result
+    }
+    th := L.cur
+    func := L.threads[th].top
+    Push(L, loader)
+    Push(L, StringValue(key))
+    if !CallValue(L, func, 1, 1) { return LUA_NATIVE_ERROR }
+    result := L.threads[th].stack[func]
+    if loaded >= 0 {
+        if result.t == LUA_TNIL {
+            existing := GetStr(L, loaded, key)
+            result = ifx existing.t == LUA_TNIL then BoolValue(true) else existing
+        }
+        SetStr(L, loaded, key, result)
+    }
+    L.threads[th].top = func
+    return ReturnValue(L, result)
+}
+
+// ---------------------------------------------------------------- coroutines
+
+CheckThread :: (L: *LuaState, n: s32) -> s32 {
+    v := Arg(L, n)
+    if v.t != LUA_TTHREAD { LuaTypeError(L, n, "coroutine"); return -1 }
+    return v.h
+}
+
+CoCreate :: (L: *LuaState) -> s32 {
+    f := Arg(L, 1)
+    if f.t != LUA_TFUNCTION { return LuaTypeError(L, 1, "function") }
+    co := NewThreadObject(L)
+    L.threads[co].stack[0] = f
+    L.threads[co].top = 1
+    L.threads[co].env = L.threads[L.cur].env
+    return ReturnValue(L, ObjectValue(LUA_TTHREAD, co))
+}
+
+CoResume :: (L: *LuaState) -> s32 {
+    co := CheckThread(L, 1)
+    if co < 0 { return LUA_NATIVE_ERROR }
+    th := L.cur
+    nargs := ArgCount(L) - 1
+    status, count := ResumeThread(L, co, nargs)
+    // Results replaced the arguments; put the status flag below them.
+    first := L.threads[th].top - count
+    Push(L, NilValue())
+    i := L.threads[th].top - 1
+    while i > first {
+        L.threads[th].stack[i] = L.threads[th].stack[i - 1]
+        i -= 1
+    }
+    L.threads[th].stack[first] = BoolValue(status == LUA_OK || status == LUA_YIELD)
+    return count + 1
+}
+
+CoYield :: (L: *LuaState) -> s32 {
+    th := L.cur
+    if th == L.main { return LuaErrorText(L, "attempt to yield from outside a coroutine") }
+    if L.threads[th].nesting > 0 { return LuaErrorText(L, "attempt to yield across metamethod/C-call boundary") }
+    return LUA_NATIVE_YIELD
+}
+
+CoStatus :: (L: *LuaState) -> s32 {
+    co := CheckThread(L, 1)
+    if co < 0 { return LUA_NATIVE_ERROR }
+    text := "suspended"
+    if co == L.cur { text = "running" }
+    else if L.threads[co].status == THREAD_DEAD { text = "dead" }
+    else if L.threads[co].status == THREAD_NORMAL { text = "normal" }
+    else if L.threads[co].status == THREAD_RUNNING { text = "normal" }
+    return ReturnValue(L, StringValue(Intern(L, text)))
+}
+
+CoRunning :: (L: *LuaState) -> s32 {
+    if L.cur == L.main { return ReturnNil(L) }
+    return ReturnValue(L, ObjectValue(LUA_TTHREAD, L.cur))
+}
+
+CoWrapCall :: (L: *LuaState) -> s32 {
+    co := IndexValue(L, LuaUpvalueIndex(1))
+    th := L.cur
+    nargs := ArgCount(L)
+    status, count := ResumeThread(L, co.h, nargs)
+    if status == LUA_OK || status == LUA_YIELD { return count }
+    message := PopValue(L)
+    if IsStringLike(message) {
+        h, ok := ToStringHandle(L, message)
+        text: Vec(u8)
+        AppendWhere(L, *text, 1)
+        BuilderAppend(text, StrView(L, h))
+        message = StringValue(InternBytes(L, *text))
+        VecFree(text)
+    }
+    SetError(L, message)
+    return LUA_NATIVE_ERROR
+}
+
+CoWrap :: (L: *LuaState) -> s32 {
+    if CoCreate(L) < 0 { return LUA_NATIVE_ERROR }
+    LuaPushNativeClosure(L, CoWrapCall, 1, "wrap")
+    return 1
+}
+
+OpenCoroutine :: (L: *LuaState) {
+    t := NewTable(L, 0, 8)
+    SetValue(L, L.globals, "coroutine", TableValue(t))
+    SetNative(L, t, "create", CoCreate)
+    SetNative(L, t, "resume", CoResume)
+    SetNative(L, t, "yield", CoYield)
+    SetNative(L, t, "status", CoStatus)
+    SetNative(L, t, "running", CoRunning)
+    SetNative(L, t, "wrap", CoWrap)
+}
+
+OpenBase :: (L: *LuaState) {
+    g := L.globals
+    SetValue(L, g, "_G", TableValue(g))
+    SetValue(L, g, "_VERSION", StringValue(Intern(L, "Lua 5.1")))
+    SetNative(L, g, "print", BasePrint)
+    SetNative(L, g, "type", BaseType)
+    SetNative(L, g, "tostring", BaseToString)
+    SetNative(L, g, "tonumber", BaseToNumber)
+    L.next_fn = SetNative(L, g, "next", BaseNext)
+    SetNative(L, g, "pairs", BasePairs)
+    SetNative(L, g, "ipairs", BaseIpairs)
+    L.inext_fn = NewNative(L, BaseInext, "ipairs_iterator")
+    SetNative(L, g, "rawget", BaseRawGet)
+    SetNative(L, g, "rawset", BaseRawSet)
+    SetNative(L, g, "rawequal", BaseRawEqual)
+    SetNative(L, g, "getmetatable", BaseGetMetatable)
+    SetNative(L, g, "setmetatable", BaseSetMetatable)
+    SetNative(L, g, "assert", BaseAssert)
+    SetNative(L, g, "error", BaseError)
+    SetNative(L, g, "pcall", BasePcall)
+    SetNative(L, g, "xpcall", BaseXpcall)
+    SetNative(L, g, "select", BaseSelect)
+    SetNative(L, g, "unpack", BaseUnpack)
+    SetNative(L, g, "load", BaseLoad)
+    SetNative(L, g, "loadstring", BaseLoadString)
+    SetNative(L, g, "loadfile", BaseLoadFile)
+    SetNative(L, g, "dofile", BaseDoFile)
+    SetNative(L, g, "getfenv", BaseGetFenv)
+    SetNative(L, g, "setfenv", BaseSetFenv)
+    SetNative(L, g, "collectgarbage", BaseCollectGarbage)
+    SetNative(L, g, "gcinfo", BaseGcInfo)
+    SetNative(L, g, "newproxy", BaseNewProxy)
+    SetNative(L, g, "require", BaseRequire)
+    package := NewTable(L, 0, 4)
+    SetValue(L, g, "package", TableValue(package))
+    loaded := NewTable(L, 0, 16)
+    SetValue(L, package, "loaded", TableValue(loaded))
+    SetValue(L, package, "preload", TableValue(NewTable(L, 0, 0)))
+    SetValue(L, package, "path", StringValue(Intern(L, "")))
+    SetValue(L, package, "cpath", StringValue(Intern(L, "")))
+    SetValue(L, loaded, "_G", TableValue(g))
+}
+
+// Register a library table in globals and package.loaded.
+RegisterLibrary :: (L: *LuaState, name: string, t: s32) {
+    SetValue(L, L.globals, name, TableValue(t))
+    loaded := PackageTable(L, "loaded")
+    if loaded >= 0 { SetValue(L, loaded, name, TableValue(t)) }
+}

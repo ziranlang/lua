@@ -1,0 +1,288 @@
+// Table library of Lua 5.1: raw access by position like ltablib.c.
+
+#scope_module
+
+TableArg :: (L: *LuaState, n: s32) -> s32 {
+    v := Arg(L, n)
+    if v.t != LUA_TTABLE { LuaTypeError(L, n, "table"); return -1 }
+    return v.h
+}
+
+TabInsert :: (L: *LuaState) -> s32 {
+    t := TableArg(L, 1)
+    if t < 0 { return LUA_NATIVE_ERROR }
+    e := TableLength(L, t) + 1
+    n := ArgCount(L)
+    if n == 2 {
+        SetInt(L, t, e, Arg(L, 2))
+        return 0
+    }
+    if n != 3 { return LuaErrorText(L, "wrong number of arguments to 'insert'") }
+    position, ok := LuaCheckInteger(L, 2)
+    if !ok { return LUA_NATIVE_ERROR }
+    if position > e { e = position }
+    i := e
+    while i > position {
+        SetInt(L, t, i, GetInt(L, t, i - 1))
+        i -= 1
+    }
+    SetInt(L, t, position, Arg(L, 3))
+    return 0
+}
+
+TabRemove :: (L: *LuaState) -> s32 {
+    t := TableArg(L, 1)
+    if t < 0 { return LUA_NATIVE_ERROR }
+    e := TableLength(L, t)
+    position, ok := LuaOptInteger(L, 2, e)
+    if !ok { return LUA_NATIVE_ERROR }
+    if e == 0 { return 0 }
+    result := GetInt(L, t, position)
+    i := position
+    while i < e {
+        SetInt(L, t, i, GetInt(L, t, i + 1))
+        i += 1
+    }
+    SetInt(L, t, e, NilValue())
+    return ReturnValue(L, result)
+}
+
+TabConcat :: (L: *LuaState) -> s32 {
+    t := TableArg(L, 1)
+    if t < 0 { return LUA_NATIVE_ERROR }
+    sep, ok1 := LuaOptString(L, 2, "")
+    if !ok1 { return LUA_NATIVE_ERROR }
+    first, ok2 := LuaOptInteger(L, 3, 1)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    last: s64 = 0
+    if Arg(L, 4).t == LUA_TNIL {
+        last = TableLength(L, t)
+    } else {
+        value, ok3 := LuaCheckInteger(L, 4)
+        if !ok3 { return LUA_NATIVE_ERROR }
+        last = value
+    }
+    out: Vec(u8)
+    i := first
+    while i <= last {
+        v := GetInt(L, t, i)
+        if v.t == LUA_TSTRING {
+            BuilderAppend(out, StrView(L, v.h))
+        } else if v.t == LUA_TNUMBER {
+            AppendNumber(*out, v.n)
+        } else {
+            VecFree(out)
+            message: Vec(u8)
+            BuilderAppend(message, "invalid value (at index ")
+            Append(*message, i)
+            BuilderAppend(message, ") in table for 'concat'")
+            result := LuaErrorText(L, BytesView(*message))
+            VecFree(message)
+            return result
+        }
+        if i < last { BuilderAppend(out, sep) }
+        i += 1
+    }
+    Push(L, StringValue(InternBytes(L, *out)))
+    VecFree(out)
+    return 1
+}
+
+TabMaxn :: (L: *LuaState) -> s32 {
+    t := TableArg(L, 1)
+    if t < 0 { return LUA_NATIVE_ERROR }
+    best := 0.0
+    key := NilValue()
+    while true {
+        k: LuaValue
+        v: LuaValue
+        found, ok := TableNext(L, t, key, *k, *v)
+        if !ok || !found { break }
+        if k.t == LUA_TNUMBER && k.n > best { best = k.n }
+        key = k
+    }
+    return ReturnValue(L, NumberValue(best))
+}
+
+TabGetn :: (L: *LuaState) -> s32 {
+    t := TableArg(L, 1)
+    if t < 0 { return LUA_NATIVE_ERROR }
+    return ReturnValue(L, NumberValue(cast(float64) TableLength(L, t)))
+}
+
+TabSetn :: (L: *LuaState) -> s32 {
+    return LuaErrorText(L, "'setn' is obsolete")
+}
+
+// Call f(k, v) for each pair until it returns non-nil.
+TabForeach :: (L: *LuaState) -> s32 {
+    t := TableArg(L, 1)
+    if t < 0 { return LUA_NATIVE_ERROR }
+    f := Arg(L, 2)
+    if f.t != LUA_TFUNCTION { return LuaTypeError(L, 2, "function") }
+    th := L.cur
+    key := NilValue()
+    while true {
+        k: LuaValue
+        v: LuaValue
+        found, ok := TableNext(L, t, key, *k, *v)
+        if !ok { return LuaErrorText(L, "invalid key to 'next'") }
+        if !found { break }
+        func := L.threads[th].top
+        Push(L, f)
+        Push(L, k)
+        Push(L, v)
+        if !CallValue(L, func, 2, 1) { return LUA_NATIVE_ERROR }
+        result := L.threads[th].stack[func]
+        L.threads[th].top = func
+        if result.t != LUA_TNIL { return ReturnValue(L, result) }
+        key = k
+    }
+    return 0
+}
+
+TabForeachi :: (L: *LuaState) -> s32 {
+    t := TableArg(L, 1)
+    if t < 0 { return LUA_NATIVE_ERROR }
+    f := Arg(L, 2)
+    if f.t != LUA_TFUNCTION { return LuaTypeError(L, 2, "function") }
+    th := L.cur
+    n := TableLength(L, t)
+    i: s64 = 1
+    while i <= n {
+        func := L.threads[th].top
+        Push(L, f)
+        Push(L, NumberValue(cast(float64) i))
+        Push(L, GetInt(L, t, i))
+        if !CallValue(L, func, 2, 1) { return LUA_NATIVE_ERROR }
+        result := L.threads[th].stack[func]
+        L.threads[th].top = func
+        if result.t != LUA_TNIL { return ReturnValue(L, result) }
+        i += 1
+    }
+    return 0
+}
+
+SortState :: struct {
+    L: *LuaState
+    t: s32
+    comp: LuaValue
+    failed: bool
+}
+
+// a < b by the comparator or the < operator.
+SortLess :: (ss: *SortState, a: LuaValue, b: LuaValue) -> bool {
+    L := ss.L
+    if ss.comp.t == LUA_TNIL {
+        less := false
+        if !LessThan(L, a, b, *less) { ss.failed = true; return false }
+        return less
+    }
+    th := L.cur
+    func := L.threads[th].top
+    Push(L, ss.comp)
+    Push(L, a)
+    Push(L, b)
+    if !CallValue(L, func, 2, 1) { ss.failed = true; return false }
+    result := L.threads[th].stack[func]
+    L.threads[th].top = func
+    return Truthy(result)
+}
+
+SortSwap :: (ss: *SortState, i: s64, j: s64) {
+    a := GetInt(ss.L, ss.t, i)
+    b := GetInt(ss.L, ss.t, j)
+    SetInt(ss.L, ss.t, i, b)
+    SetInt(ss.L, ss.t, j, a)
+}
+
+SortFail :: (ss: *SortState) -> bool {
+    if !ss.failed {
+        ss.failed = true
+        LuaErrorText(ss.L, "invalid order function for sorting")
+    }
+    return false
+}
+
+// The quicksort of ltablib.c: median of three, recursion on the smaller half.
+AuxSort :: (ss: *SortState, lo_in: s64, up_in: s64) -> bool {
+    L := ss.L
+    t := ss.t
+    lo := lo_in
+    up := up_in
+    while lo < up {
+        // Sort elements lo, (lo+up)/2 and up.
+        if SortLess(ss, GetInt(L, t, up), GetInt(L, t, lo)) { SortSwap(ss, lo, up) }
+        if ss.failed { return false }
+        if up - lo == 1 { break }
+        i := (lo + up) / 2
+        if SortLess(ss, GetInt(L, t, i), GetInt(L, t, lo)) {
+            SortSwap(ss, i, lo)
+        } else {
+            if ss.failed { return false }
+            if SortLess(ss, GetInt(L, t, up), GetInt(L, t, i)) { SortSwap(ss, i, up) }
+        }
+        if ss.failed { return false }
+        if up - lo == 2 { break }
+        pivot := GetInt(L, t, i)
+        SortSwap(ss, i, up - 1)
+        // Invariant: a[lo] <= P == a[up-1] <= a[up].
+        i = lo
+        j := up - 1
+        while true {
+            i += 1
+            while SortLess(ss, GetInt(L, t, i), pivot) {
+                if i > up { return SortFail(ss) }
+                i += 1
+            }
+            if ss.failed { return false }
+            j -= 1
+            while SortLess(ss, pivot, GetInt(L, t, j)) {
+                if j < lo { return SortFail(ss) }
+                j -= 1
+            }
+            if ss.failed { return false }
+            if j < i { break }
+            SortSwap(ss, i, j)
+        }
+        SortSwap(ss, up - 1, i)
+        // a[lo..i-1] <= a[i] == P <= a[i+1..up]; recurse into the smaller part.
+        if i - lo < up - i {
+            if !AuxSort(ss, lo, i - 1) { return false }
+            lo = i + 1
+        } else {
+            if !AuxSort(ss, i + 1, up) { return false }
+            up = i - 1
+        }
+    }
+    return true
+}
+
+TabSort :: (L: *LuaState) -> s32 {
+    t := TableArg(L, 1)
+    if t < 0 { return LUA_NATIVE_ERROR }
+    n := TableLength(L, t)
+    comp := Arg(L, 2)
+    if comp.t != LUA_TNIL && comp.t != LUA_TFUNCTION { return LuaTypeError(L, 2, "function") }
+    ss: SortState
+    ss.L = L
+    ss.t = t
+    ss.comp = comp
+    ss.failed = false
+    if !AuxSort(*ss, 1, n) { return LUA_NATIVE_ERROR }
+    return 0
+}
+
+OpenTable :: (L: *LuaState) {
+    t := NewTable(L, 0, 12)
+    RegisterLibrary(L, "table", t)
+    SetNative(L, t, "insert", TabInsert)
+    SetNative(L, t, "remove", TabRemove)
+    SetNative(L, t, "concat", TabConcat)
+    SetNative(L, t, "sort", TabSort)
+    SetNative(L, t, "maxn", TabMaxn)
+    SetNative(L, t, "getn", TabGetn)
+    SetNative(L, t, "setn", TabSetn)
+    SetNative(L, t, "foreach", TabForeach)
+    SetNative(L, t, "foreachi", TabForeachi)
+}

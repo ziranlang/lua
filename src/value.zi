@@ -1,0 +1,618 @@
+// Core value and object model: tagged values, VM-owned object arenas and
+// interned strings. Objects are referenced by s32 handles into per-kind
+// arenas held inline in the state, so cyclic Lua graphs need no owning
+// pointers. Never keep a pointer to an arena element across an allocation
+// of the same kind: the arena may move its elements when it grows.
+
+#scope_export
+
+// Value tags. FALSE and TRUE are separate tags so truthiness is one compare.
+LUA_TNIL :: 0;
+LUA_TFALSE :: 1;
+LUA_TTRUE :: 2;
+LUA_TNUMBER :: 3;
+LUA_TSTRING :: 4;
+LUA_TTABLE :: 5;
+LUA_TFUNCTION :: 6;
+LUA_TUSERDATA :: 7;
+LUA_TTHREAD :: 8;
+LUA_TLIGHTUSERDATA :: 9;
+// Internal: a mutable cell holding a captured local.
+LUA_TBOX :: 10;
+
+// Status codes returned by calls and loads.
+LUA_OK :: 0;
+LUA_YIELD :: 1;
+LUA_ERRRUN :: 2;
+LUA_ERRSYNTAX :: 3;
+LUA_ERRMEM :: 4;
+LUA_ERRERR :: 5;
+LUA_ERRFILE :: 6;
+
+// A native returns its result count, or one of these.
+LUA_NATIVE_ERROR :: -1;
+LUA_NATIVE_YIELD :: -2;
+
+LUA_MULTRET :: -1;
+
+LuaValue :: struct {
+    n: float64
+    h: s32
+    t: u8
+}
+
+// A native Ziran function callable from Lua. It reads its arguments at
+// stack indices 1..LuaGetTop(L), pushes results and returns their count,
+// or returns LuaRaise(L) / LuaErrorText(L, ...) to raise an error.
+LuaNative :: #type (L: *LuaState) -> s32;
+
+// Called every `count` VM checkpoints (calls and backward jumps). Return
+// true to continue, false to raise an error (the message is the value on
+// top of the stack when the hook pushed one, else "instruction limit").
+LuaHook :: #type (L: *LuaState) -> bool;
+
+// Called when a userdata created with a finalizer is collected.
+LuaFinalizer :: #type (L: *LuaState, data: *void, tag: s64) -> void;
+
+// Receives print() output; null writes to standard output.
+LuaPrintSink :: #type (context: *void, text: string) -> void;
+
+LuaLimits :: struct {
+    // Estimated live heap bytes before allocation raises "not enough
+    // memory"; 0 means unlimited.
+    max_memory: s64
+    // Maximum nested native re-entry depth (natives calling back into Lua).
+    max_native_depth: s32
+    // Maximum Lua call frames per thread.
+    max_frames: s32
+}
+
+LuaDefaultLimits :: () -> LuaLimits {
+    limits: LuaLimits
+    limits.max_memory = 0
+    limits.max_native_depth = 190
+    limits.max_frames = 200000
+    return limits
+}
+
+#scope_module
+
+NilValue :: () -> LuaValue #inline { v: LuaValue; return v }
+BoolValue :: (b: bool) -> LuaValue #inline { v: LuaValue; v.t = ifx b then cast(u8) LUA_TTRUE else cast(u8) LUA_TFALSE; return v }
+NumberValue :: (n: float64) -> LuaValue #inline { v: LuaValue; v.t = LUA_TNUMBER; v.n = n; return v }
+ObjectValue :: (t: u8, h: s32) -> LuaValue #inline { v: LuaValue; v.t = t; v.h = h; return v }
+StringValue :: (h: s32) -> LuaValue #inline { v: LuaValue; v.t = LUA_TSTRING; v.h = h; return v }
+TableValue :: (h: s32) -> LuaValue #inline { v: LuaValue; v.t = LUA_TTABLE; v.h = h; return v }
+FunctionValue :: (h: s32) -> LuaValue #inline { v: LuaValue; v.t = LUA_TFUNCTION; v.h = h; return v }
+
+Truthy :: (v: LuaValue) -> bool #inline { return v.t >= LUA_TTRUE }
+
+RawEqual :: (a: LuaValue, b: LuaValue) -> bool #inline {
+    if a.t != b.t { return false }
+    if a.t == LUA_TNUMBER || a.t == LUA_TLIGHTUSERDATA { return a.n == b.n }
+    if a.t <= LUA_TTRUE { return true }
+    return a.h == b.h
+}
+
+// The object records live in the state's arenas. They are exported with
+// LuaState (whose fields hold them) but are not part of the stable API.
+#scope_export
+
+LuaString :: struct {
+    bytes: Vec(u8)
+    hash: u32
+    mark: u8
+    // Reserved word index + 1 for the lexer, 0 otherwise.
+    reserved: u8
+    live: bool
+}
+
+LuaNode :: struct {
+    key: LuaValue
+    value: LuaValue
+}
+
+LuaTable :: struct {
+    arr: Vec(LuaValue)
+    nodes: Vec(LuaNode)
+    // Occupied slots in nodes, including dead nil-valued keys.
+    used: s64
+    meta: s32
+    mark: u8
+    live: bool
+    // Bit i set: metamethod i is known absent (cleared on any raw write).
+    absent: u32
+}
+
+LuaUpvalDesc :: struct {
+    // true: capture the parent's local register (which holds a box);
+    // false: capture the parent's upvalue at `index`.
+    from_local: bool
+    index: s32
+}
+
+LuaLocVar :: struct {
+    name: s32
+    reg: s32
+    start_pc: s32
+    end_pc: s32
+}
+
+LuaInstr :: struct {
+    op: u8
+    a: s32
+    b: s32
+    c: s32
+}
+
+LuaProto :: struct {
+    code: Vec(LuaInstr)
+    lines: Vec(s32)
+    constants: Vec(LuaValue)
+    protos: Vec(s32)
+    upvals: Vec(LuaUpvalDesc)
+    upval_names: Vec(s32)
+    locvars: Vec(LuaLocVar)
+    num_params: s32
+    is_vararg: bool
+    max_stack: s32
+    line_defined: s32
+    last_line: s32
+    source: s32
+    mark: u8
+    live: bool
+}
+
+LuaClosure :: struct {
+    // >= 0: a Lua function's prototype; -1: a native function.
+    proto: s32
+    native: LuaNative
+    // Lua closures: box handles.
+    upvals: Vec(s32)
+    // Native closures: their upvalue values.
+    native_upvals: Vec(LuaValue)
+    env: s32
+    // Native name for tracebacks ("print", "format", ...), or -1.
+    name: s32
+    mark: u8
+    live: bool
+}
+
+LuaBox :: struct {
+    value: LuaValue
+    mark: u8
+    live: bool
+}
+
+LuaUserdata :: struct {
+    data: *void
+    tag: s64
+    meta: s32
+    env: s32
+    finalizer: LuaFinalizer
+    has_finalizer: bool
+    mark: u8
+    live: bool
+    finalized: bool
+}
+
+LuaFrame :: struct {
+    closure: s32
+    // Stack index of the called function value; results go here.
+    func: s64
+    // Register 0 (Lua) or argument 1 (native).
+    base: s64
+    pc: s64
+    // Requested result count, LUA_MULTRET for all.
+    want: s32
+    native: bool
+    // Extra arguments of a vararg function live at [vararg, vararg + nvarargs).
+    vararg: s64
+    nvarargs: s32
+    // Number of tail calls that replaced this frame (for tracebacks).
+    tail: s32
+}
+
+LuaHandler :: struct {
+    handler: LuaValue
+    // Frames at or above this level are guarded by the handler.
+    frame_level: s64
+}
+
+THREAD_SUSPENDED :: 0;
+THREAD_RUNNING :: 1;
+THREAD_NORMAL :: 2;
+THREAD_DEAD :: 3;
+
+LuaThread :: struct {
+    stack: Vec(LuaValue)
+    frames: Vec(LuaFrame)
+    // Protected-call handlers for xpcall, innermost last.
+    handlers: Vec(LuaHandler)
+    top: s64
+    status: u8
+    mark: u8
+    live: bool
+    // Nested interpreter entries on this thread (natives calling back).
+    nesting: s32
+    // A yield is pending: resume values land at yield_func with yield_want.
+    yield_func: s64
+    yield_want: s32
+    started: bool
+    env: s32
+}
+
+#scope_module
+
+// Metamethod indices.
+TM_INDEX :: 0;
+TM_NEWINDEX :: 1;
+TM_GC :: 2;
+TM_MODE :: 3;
+TM_EQ :: 4;
+TM_ADD :: 5;
+TM_SUB :: 6;
+TM_MUL :: 7;
+TM_DIV :: 8;
+TM_MOD :: 9;
+TM_POW :: 10;
+TM_UNM :: 11;
+TM_LEN :: 12;
+TM_LT :: 13;
+TM_LE :: 14;
+TM_CONCAT :: 15;
+TM_CALL :: 16;
+TM_TOSTRING :: 17;
+TM_METATABLE :: 18;
+TM_NAME :: 19;
+TM_COUNT :: 20;
+
+#scope_export
+
+// One Lua universe. The host owns this record (a global or a long-lived
+// local) and passes its address to every API call; LuaOpen initializes it
+// and LuaClose releases everything it holds.
+LuaState :: struct {
+    strings: Vec(LuaString)
+    string_free: Vec(s32)
+    intern: Vec(s32)
+    intern_used: s64
+
+    tables: Vec(LuaTable)
+    table_free: Vec(s32)
+    closures: Vec(LuaClosure)
+    closure_free: Vec(s32)
+    protos: Vec(LuaProto)
+    proto_free: Vec(s32)
+    boxes: Vec(LuaBox)
+    box_free: Vec(s32)
+    userdata: Vec(LuaUserdata)
+    userdata_free: Vec(s32)
+    threads: Vec(LuaThread)
+    thread_free: Vec(s32)
+
+    // The running thread.
+    cur: s32
+    main: s32
+    globals: s32
+    registry: s32
+    // Type metatables for strings and other non-table values, by tag.
+    type_meta: [11]s32
+    tm_names: [20]s32
+    // Common interned names.
+    name_n: s32
+    name_goto: s32
+    name_self: s32
+    name_loaded: s32
+    // The base `next` function and the ipairs iterator, for loop fast paths.
+    next_fn: s32
+    inext_fn: s32
+    // Extra frames and native levels allowed while an error handler runs.
+    handler_slack: s32
+    // Weak tables found while marking.
+    weak: Vec(s32)
+
+    // Pending error object while an error propagates.
+    error: LuaValue
+    // The pending error already went through its xpcall handler.
+    error_traced: bool
+    // Host refs: free registry array slots.
+    ref_free: Vec(s32)
+
+    // Garbage collector accounting (estimated bytes).
+    allocated: s64
+    threshold: s64
+    gray: Vec(LuaValue)
+    pending_finalize: Vec(s32)
+    collecting: bool
+    // Threads on the resume chain, for GC roots.
+    resumers: Vec(s32)
+    // Native depth across threads.
+    native_depth: s32
+    limits: LuaLimits
+    open: bool
+
+    hook: LuaHook
+    hook_set: bool
+    hook_count: s64
+    hook_left: s64
+    print_sink: LuaPrintSink
+    print_sink_set: bool
+    print_context: *void
+    // Directory prefix for dofile/loadfile/io.open; empty disables files.
+    file_root: Vec(u8)
+    random_state: u64
+    // Monotonic nanoseconds at open, the zero of os.clock.
+    clock_start: s64
+    // Environment name prefixes os.getenv may read, separated by 0 bytes.
+    env_allow: Vec(u8)
+    // Metatable shared by io file handles.
+    file_meta: s32
+    // Scratch byte buffers for building strings.
+    scratch: Vec(u8)
+    scratch2: Vec(u8)
+    // Host context pointer for embedding applications.
+    host: *void
+}
+
+#scope_module
+
+// String bytes as a borrowed view. Valid until the string is collected;
+// the bytes never move while the string lives.
+// Ziran has no portable way to borrow a Vec(u8) held behind a pointer as a
+// string whose lifetime the checker can follow, so the VM builds the string
+// descriptor itself, the way std/byte_text_linux.zi does (C target).
+RawText :: struct { data: *u8; length: u64; }
+
+ViewOf :: (first: *u8, count: s64) -> string #inline {
+    result: string = ""
+    if count <= 0 { return result }
+    descriptor: *RawText = cast(*RawText)(*result)
+    descriptor.data = first
+    descriptor.length = cast(u64) count
+    return result
+}
+
+StrView :: (L: *LuaState, h: s32) -> string #inline {
+    count := L.strings[h].bytes.count
+    if count == 0 { return "" }
+    return ViewOf(*L.strings[h].bytes[0], count)
+}
+
+StrLen :: (L: *LuaState, h: s32) -> s64 #inline { return L.strings[h].bytes.count }
+
+BytesView :: (bytes: *Vec(u8)) -> string #inline {
+    if bytes.count == 0 { return "" }
+    return ViewOf(*(<<bytes)[0], bytes.count)
+}
+
+HashBytes :: (text: string) -> u32 {
+    // FNV-1a; long strings hash a sample like Lua 5.1 does.
+    h: u32 = 2166136261 ^ cast(u32) text.count
+    step: s64 = (text.count >> 5) + 1
+    i := text.count
+    while i >= step {
+        h = (h ^ cast(u32) text[i - 1]) * 16777619
+        i -= step
+    }
+    return h
+}
+
+GrowIntern :: (L: *LuaState) {
+    old_count := L.intern.count
+    capacity: s64 = ifx old_count == 0 then 1024 else old_count * 2
+    fresh: Vec(s32)
+    VecResize(fresh, capacity)
+    i: s64 = 0
+    while i < capacity { fresh[i] = -1; i += 1 }
+    mask := capacity - 1
+    i = 0
+    while i < old_count {
+        h := L.intern[i]
+        if h >= 0 {
+            slot := cast(s64) L.strings[h].hash & mask
+            while fresh[slot] >= 0 { slot = (slot + 1) & mask }
+            fresh[slot] = h
+        }
+        i += 1
+    }
+    VecSwap(fresh, L.intern)
+    VecFree(fresh)
+}
+
+SameBytes :: (L: *LuaState, h: s32, text: string) -> bool {
+    if L.strings[h].bytes.count != text.count { return false }
+    i: s64 = 0
+    while i < text.count {
+        if L.strings[h].bytes[i] != text[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// Intern bytes and return the string handle. `text` must not view the
+// string arena's own bytes of a string that could be collected.
+Intern :: (L: *LuaState, text: string) -> s32 {
+    if (L.intern_used + 1) * 2 > L.intern.count { GrowIntern(L) }
+    hash := HashBytes(text)
+    mask := L.intern.count - 1
+    slot := cast(s64) hash & mask
+    while true {
+        h := L.intern[slot]
+        if h < 0 { break }
+        if L.strings[h].hash == hash && SameBytes(L, h, text) { return h }
+        slot = (slot + 1) & mask
+    }
+    handle: s32
+    if L.string_free.count > 0 {
+        handle = L.string_free[L.string_free.count - 1]
+        VecResize(L.string_free, L.string_free.count - 1)
+    } else {
+        handle = cast(s32) L.strings.count
+        VecResize(L.strings, L.strings.count + 1)
+    }
+    VecClear(L.strings[handle].bytes)
+    BuilderAppend(L.strings[handle].bytes, text)
+    L.strings[handle].hash = hash
+    L.strings[handle].mark = 0
+    L.strings[handle].reserved = 0
+    L.strings[handle].live = true
+    L.intern[slot] = handle
+    L.intern_used += 1
+    L.allocated += 40 + text.count
+    return handle
+}
+
+InternBytes :: (L: *LuaState, bytes: *Vec(u8)) -> s32 {
+    return Intern(L, BytesView(bytes))
+}
+
+// Remove a dead string from the intern table (backward-shift deletion).
+Unintern :: (L: *LuaState, h: s32) {
+    mask := L.intern.count - 1
+    slot := cast(s64) L.strings[h].hash & mask
+    while L.intern[slot] != h { slot = (slot + 1) & mask }
+    hole := slot
+    next := (hole + 1) & mask
+    while L.intern[next] >= 0 {
+        other := L.intern[next]
+        home := cast(s64) L.strings[other].hash & mask
+        distance_next := (next - home) & mask
+        distance_hole := (hole - home) & mask
+        if distance_hole < distance_next {
+            L.intern[hole] = other
+            hole = next
+        }
+        next = (next + 1) & mask
+    }
+    L.intern[hole] = -1
+    L.intern_used -= 1
+}
+
+TakeSlot :: (free_list: *Vec(s32), count: s64) -> s32 {
+    if free_list.count > 0 {
+        handle := (<<free_list)[free_list.count - 1]
+        VecResize(<<free_list, free_list.count - 1)
+        return handle
+    }
+    return -1
+}
+
+NewTable :: (L: *LuaState, narr: s64, nhash: s64) -> s32 {
+    handle := TakeSlot(*L.table_free, 0)
+    if handle < 0 {
+        handle = cast(s32) L.tables.count
+        VecResize(L.tables, L.tables.count + 1)
+    }
+    L.tables[handle].meta = -1
+    L.tables[handle].mark = 0
+    L.tables[handle].live = true
+    L.tables[handle].absent = 0
+    L.tables[handle].used = 0
+    if narr > 0 { VecReserve(L.tables[handle].arr, narr) }
+    if nhash > 0 {
+        size: s64 = 4
+        while size * 3 < nhash * 4 { size *= 2 }
+        VecResize(L.tables[handle].nodes, size)
+    }
+    L.allocated += 80 + narr * 16 + L.tables[handle].nodes.count * 32
+    return handle
+}
+
+NewBox :: (L: *LuaState, value: LuaValue) -> s32 {
+    handle := TakeSlot(*L.box_free, 0)
+    if handle < 0 {
+        handle = cast(s32) L.boxes.count
+        VecResize(L.boxes, L.boxes.count + 1)
+    }
+    L.boxes[handle].value = value
+    L.boxes[handle].mark = 0
+    L.boxes[handle].live = true
+    L.allocated += 32
+    return handle
+}
+
+NewClosureObject :: (L: *LuaState) -> s32 {
+    handle := TakeSlot(*L.closure_free, 0)
+    if handle < 0 {
+        handle = cast(s32) L.closures.count
+        VecResize(L.closures, L.closures.count + 1)
+    }
+    L.closures[handle].proto = -1
+    L.closures[handle].name = -1
+    L.closures[handle].env = L.globals
+    L.closures[handle].mark = 0
+    L.closures[handle].live = true
+    L.allocated += 64
+    return handle
+}
+
+NewProtoObject :: (L: *LuaState) -> s32 {
+    handle := TakeSlot(*L.proto_free, 0)
+    if handle < 0 {
+        handle = cast(s32) L.protos.count
+        VecResize(L.protos, L.protos.count + 1)
+    }
+    L.protos[handle].source = -1
+    L.protos[handle].mark = 0
+    L.protos[handle].live = true
+    L.allocated += 160
+    return handle
+}
+
+NewUserdataObject :: (L: *LuaState) -> s32 {
+    handle := TakeSlot(*L.userdata_free, 0)
+    if handle < 0 {
+        handle = cast(s32) L.userdata.count
+        VecResize(L.userdata, L.userdata.count + 1)
+    }
+    L.userdata[handle].data = null
+    L.userdata[handle].tag = 0
+    L.userdata[handle].meta = -1
+    L.userdata[handle].env = -1
+    L.userdata[handle].has_finalizer = false
+    L.userdata[handle].mark = 0
+    L.userdata[handle].live = true
+    L.userdata[handle].finalized = false
+    L.allocated += 64
+    return handle
+}
+
+NewThreadObject :: (L: *LuaState) -> s32 {
+    handle := TakeSlot(*L.thread_free, 0)
+    if handle < 0 {
+        handle = cast(s32) L.threads.count
+        VecResize(L.threads, L.threads.count + 1)
+    }
+    L.threads[handle].env = L.globals
+    L.threads[handle].top = 0
+    L.threads[handle].status = THREAD_SUSPENDED
+    L.threads[handle].mark = 0
+    L.threads[handle].live = true
+    L.threads[handle].nesting = 0
+    L.threads[handle].started = false
+    VecResize(L.threads[handle].stack, 64)
+    L.allocated += 64 * 16 + 160
+    return handle
+}
+
+// Make sure the running thread's stack has at least `at` slots.
+EnsureStack :: (L: *LuaState, at: s64) -> bool #inline {
+    if at <= L.threads[L.cur].stack.count { return true }
+    return GrowStack(L, L.cur, at)
+}
+
+GrowStack :: (L: *LuaState, thread: s32, at: s64) -> bool #cold {
+    size := L.threads[thread].stack.count * 2
+    if size < 64 { size = 64 }
+    while size < at { size *= 2 }
+    if size > 8000000 { return false }
+    old := L.threads[thread].stack.count
+    L.allocated += (size - old) * 16
+    return VecResize(L.threads[thread].stack, size)
+}
+
+EnsureStackOf :: (L: *LuaState, thread: s32, at: s64) -> bool #inline {
+    if at <= L.threads[thread].stack.count { return true }
+    return GrowStack(L, thread, at)
+}

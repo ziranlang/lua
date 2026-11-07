@@ -1,0 +1,1161 @@
+// The embedding API. A host owns one LuaState record per Lua universe and
+// passes its address everywhere:
+//
+//     state: LuaState;
+//     L := *state
+//     LuaOpen(L)
+//     status := LuaDoString(L, "print('hi')", "=demo")
+//     LuaClose(L)
+//
+// Values live on a stack, as in the C API: index 1 is the first argument of
+// the running native (or the first host value), -1 the top. Calls that can
+// run Lua code return a status or a bool; on failure the error object is on
+// the stack (protected calls) or pending (inside natives, which then return
+// LuaRaiseError(L)).
+
+#scope_export
+
+// Type codes returned by LuaType, matching the C API.
+LUA_TYPE_NONE :: -1;
+LUA_TYPE_NIL :: 0;
+LUA_TYPE_BOOLEAN :: 1;
+LUA_TYPE_LIGHTUSERDATA :: 2;
+LUA_TYPE_NUMBER :: 3;
+LUA_TYPE_STRING :: 4;
+LUA_TYPE_TABLE :: 5;
+LUA_TYPE_FUNCTION :: 6;
+LUA_TYPE_USERDATA :: 7;
+LUA_TYPE_THREAD :: 8;
+
+// Pseudo-indices.
+LUA_REGISTRYINDEX :: -10000;
+LUA_ENVIRONINDEX :: -10001;
+LUA_GLOBALSINDEX :: -10002;
+
+// LuaRef result for nil.
+LUA_REFNIL :: -1;
+LUA_NOREF :: -2;
+
+LuaUpvalueIndex :: (i: s32) -> s32 { return LUA_GLOBALSINDEX - i }
+
+#scope_module
+
+// ---------------------------------------------------------------- internals
+
+StackBase :: (L: *LuaState) -> s64 #inline {
+    th := L.cur
+    n := L.threads[th].frames.count
+    if n == 0 { return 0 }
+    return L.threads[th].frames[n - 1].base
+}
+
+Top :: (L: *LuaState) -> s64 #inline { return L.threads[L.cur].top }
+
+// Absolute stack slot of a stack index, or -1 for pseudo/invalid ones.
+Slot :: (L: *LuaState, index: s32) -> s64 {
+    if index > 0 {
+        position := StackBase(L) + index - 1
+        if position >= Top(L) { return -1 }
+        return position
+    }
+    if index > LUA_REGISTRYINDEX {
+        position := Top(L) + index
+        if position < StackBase(L) { return -1 }
+        return position
+    }
+    return -1
+}
+
+CurrentClosure :: (L: *LuaState) -> s32 {
+    th := L.cur
+    n := L.threads[th].frames.count
+    if n == 0 { return -1 }
+    return L.threads[th].frames[n - 1].closure
+}
+
+IndexValue :: (L: *LuaState, index: s32) -> LuaValue {
+    if index > LUA_REGISTRYINDEX {
+        position := Slot(L, index)
+        if position < 0 { return NilValue() }
+        return L.threads[L.cur].stack[position]
+    }
+    if index == LUA_REGISTRYINDEX { return TableValue(L.registry) }
+    if index == LUA_GLOBALSINDEX { return TableValue(L.threads[L.cur].env) }
+    cl := CurrentClosure(L)
+    if index == LUA_ENVIRONINDEX {
+        if cl < 0 { return TableValue(L.globals) }
+        return TableValue(L.closures[cl].env)
+    }
+    n := cast(s64)(LUA_GLOBALSINDEX - index)
+    if cl < 0 || n < 1 || n > L.closures[cl].native_upvals.count { return NilValue() }
+    return L.closures[cl].native_upvals[n - 1]
+}
+
+SetIndexValue :: (L: *LuaState, index: s32, v: LuaValue) {
+    if index > LUA_REGISTRYINDEX {
+        position := Slot(L, index)
+        if position >= 0 { L.threads[L.cur].stack[position] = v }
+        return
+    }
+    cl := CurrentClosure(L)
+    if index == LUA_ENVIRONINDEX || index == LUA_GLOBALSINDEX {
+        if v.t != LUA_TTABLE { return }
+        if index == LUA_GLOBALSINDEX { L.threads[L.cur].env = v.h }
+        else if cl >= 0 { L.closures[cl].env = v.h }
+        return
+    }
+    n := cast(s64)(LUA_GLOBALSINDEX - index)
+    if cl >= 0 && n >= 1 && n <= L.closures[cl].native_upvals.count {
+        L.closures[cl].native_upvals[n - 1] = v
+    }
+}
+
+Push :: (L: *LuaState, v: LuaValue) #inline {
+    th := L.cur
+    top := L.threads[th].top
+    if top >= L.threads[th].stack.count { GrowStack(L, th, top + 1) }
+    L.threads[th].stack[top] = v
+    L.threads[th].top = top + 1
+}
+
+PopValue :: (L: *LuaState) -> LuaValue #inline {
+    th := L.cur
+    L.threads[th].top -= 1
+    return L.threads[th].stack[L.threads[th].top]
+}
+
+ArgCount :: (L: *LuaState) -> s32 #inline { return cast(s32)(Top(L) - StackBase(L)) }
+
+Arg :: (L: *LuaState, i: s32) -> LuaValue #inline {
+    position := StackBase(L) + i - 1
+    if i < 1 || position >= Top(L) { return NilValue() }
+    return L.threads[L.cur].stack[position]
+}
+
+PublicType :: (v: LuaValue) -> s32 {
+    t := v.t
+    if t == LUA_TNIL { return LUA_TYPE_NIL }
+    if t == LUA_TFALSE || t == LUA_TTRUE { return LUA_TYPE_BOOLEAN }
+    if t == LUA_TNUMBER { return LUA_TYPE_NUMBER }
+    if t == LUA_TSTRING { return LUA_TYPE_STRING }
+    if t == LUA_TTABLE { return LUA_TYPE_TABLE }
+    if t == LUA_TFUNCTION { return LUA_TYPE_FUNCTION }
+    if t == LUA_TUSERDATA { return LUA_TYPE_USERDATA }
+    if t == LUA_TTHREAD { return LUA_TYPE_THREAD }
+    if t == LUA_TLIGHTUSERDATA { return LUA_TYPE_LIGHTUSERDATA }
+    return LUA_TYPE_NONE
+}
+
+NewNative :: (L: *LuaState, fn: LuaNative, name: string) -> s32 {
+    h := NewClosureObject(L)
+    L.closures[h].native = fn
+    if name.count > 0 { L.closures[h].name = Intern(L, name) }
+    return h
+}
+
+// Name of the running native for argument errors.
+NativeName :: (L: *LuaState) -> string {
+    th := L.cur
+    frame := L.threads[th].frames.count - 1
+    if frame < 0 { return "?" }
+    kind, name := FrameFunctionName(L, th, frame)
+    if kind == NAME_NONE || name < 0 { return "?" }
+    return StrView(L, name)
+}
+
+// Protected call of stack[func] with nargs arguments. Results land at func;
+// on error the frames above the caller are dropped and L.error holds the
+// error object. `handler` (non-nil) runs at the error point like xpcall's.
+ProtectedCall :: (L: *LuaState, func: s64, nargs: s32, want: s32, handler: LuaValue) -> s32 {
+    th := L.cur
+    frames := L.threads[th].frames.count
+    handlers := L.threads[th].handlers.count
+    entry: LuaHandler
+    entry.handler = handler
+    entry.frame_level = frames
+    VecPush(L.threads[th].handlers, entry)
+    ok := CallValue(L, func, nargs, want)
+    VecResize(L.threads[th].handlers, handlers)
+    if ok { return LUA_OK }
+    VecResize(L.threads[th].frames, frames)
+    L.error_traced = false
+    return LUA_ERRRUN
+}
+
+// Compile text into a closure on top of the stack; status and message on failure.
+LoadChunk :: (L: *LuaState, text: string, chunkname: string, env: s32) -> s32 {
+    error: Vec(u8)
+    proto := CompileChunk(L, text, chunkname, *error)
+    if proto < 0 {
+        Push(L, StringValue(InternBytes(L, *error)))
+        VecFree(error)
+        return LUA_ERRSYNTAX
+    }
+    VecFree(error)
+    h := NewClosureObject(L)
+    L.closures[h].proto = proto
+    L.closures[h].env = ifx env >= 0 then env else L.globals
+    Push(L, FunctionValue(h))
+    return LUA_OK
+}
+
+// Resume `co` with `nargs` values from the top of the running stack. The
+// results (or the error object) replace them; returns the status and the
+// number of values pushed.
+ResumeThread :: (L: *LuaState, co: s32, nargs: s32) -> (status: s32, count: s32) {
+    caller := L.cur
+    if L.threads[co].status != THREAD_SUSPENDED {
+        L.threads[caller].top -= nargs
+        message := ifx L.threads[co].status == THREAD_DEAD then "cannot resume dead coroutine" else "cannot resume non-suspended coroutine"
+        Push(L, StringValue(Intern(L, message)))
+        return LUA_ERRRUN, 1
+    }
+    if L.native_depth >= L.limits.max_native_depth {
+        L.threads[caller].top -= nargs
+        Push(L, StringValue(Intern(L, "C stack overflow")))
+        return LUA_ERRRUN, 1
+    }
+    source := L.threads[caller].top - nargs
+    started := L.threads[co].started
+    position: s64 = 1
+    if started { position = L.threads[co].yield_func }
+    if !EnsureStackOf(L, co, position + nargs + 64) {
+        L.threads[caller].top -= nargs
+        Push(L, StringValue(Intern(L, "stack overflow")))
+        return LUA_ERRRUN, 1
+    }
+    i: s64 = 0
+    while i < nargs {
+        L.threads[co].stack[position + i] = L.threads[caller].stack[source + i]
+        i += 1
+    }
+    L.threads[caller].top = source
+    L.threads[co].status = THREAD_RUNNING
+    L.threads[caller].status = THREAD_NORMAL
+    VecPush(L.resumers, caller)
+    L.cur = co
+    L.native_depth += 1
+    status: s32 = LUA_OK
+    body_returned := false
+    if !started {
+        L.threads[co].started = true
+        L.threads[co].top = 1 + nargs
+        r := Precall(L, 0, nargs, LUA_MULTRET)
+        if r == CALL_LUA {
+            status = Execute(L, 0)
+        } else if r == CALL_YIELD {
+            status = LUA_YIELD
+        } else if r == CALL_NOT_FUNCTION {
+            TypeError(L, L.threads[co].stack[0], "call", -1)
+            status = LUA_ERRRUN
+        } else if r == CALL_ERROR {
+            status = LUA_ERRRUN
+        }
+    } else {
+        func := position
+        want := L.threads[co].yield_want
+        MoveResults(L, func, func, nargs, want)
+        n := L.threads[co].frames.count
+        if n == 0 {
+            // The body itself was coroutine.yield: it returns the values.
+            status = LUA_OK
+            body_returned = true
+        } else {
+            if want >= 0 {
+                cl := L.threads[co].frames[n - 1].closure
+                L.threads[co].top = L.threads[co].frames[n - 1].base + L.protos[L.closures[cl].proto].max_stack
+            }
+            status = Execute(L, 0)
+        }
+    }
+    L.native_depth -= 1
+    L.cur = caller
+    VecResize(L.resumers, L.resumers.count - 1)
+    L.threads[caller].status = THREAD_RUNNING
+    if status == LUA_OK || status == LUA_YIELD {
+        first: s64 = 0
+        last := L.threads[co].top
+        if status == LUA_YIELD {
+            first = L.threads[co].yield_func + 1
+            L.threads[co].status = THREAD_SUSPENDED
+        } else {
+            first = 0
+            if body_returned { first = position }
+            L.threads[co].status = THREAD_DEAD
+        }
+        count := last - first
+        if count < 0 { count = 0 }
+        if !EnsureStackOf(L, caller, L.threads[caller].top + count + 1) {
+            L.threads[co].status = THREAD_DEAD
+            Push(L, StringValue(Intern(L, "stack overflow")))
+            return LUA_ERRRUN, 1
+        }
+        i = 0
+        while i < count {
+            Push(L, L.threads[co].stack[first + i])
+            i += 1
+        }
+        if status == LUA_OK { L.threads[co].top = 0 } else { L.threads[co].top = first - 1 }
+        return status, cast(s32) count
+    }
+    L.threads[co].status = THREAD_DEAD
+    VecResize(L.threads[co].frames, 0)
+    L.threads[co].top = 0
+    Push(L, L.error)
+    L.error = NilValue()
+    L.error_traced = false
+    return LUA_ERRRUN, 1
+}
+
+// ---------------------------------------------------------------- state
+
+#scope_export
+
+// Initialize a state with the standard libraries. Returns false when the
+// record was already open.
+LuaOpen :: (L: *LuaState) -> bool {
+    if L.open { return false }
+    L.limits = LuaDefaultLimits()
+    L.threshold = 4194304
+    L.hook_left = 1000000000
+    L.random_state = 0x2545F4914F6CDD1D
+    L.next_fn = -1
+    L.inext_fn = -1
+    L.file_meta = -1
+    i: s64 = 0
+    while i < 11 { L.type_meta[i] = -1; i += 1 }
+    L.globals = -1
+    L.globals = NewTable(L, 0, 64)
+    L.registry = NewTable(L, 0, 8)
+    L.main = NewThreadObject(L)
+    L.cur = L.main
+    L.threads[L.main].status = THREAD_RUNNING
+    L.threads[L.main].started = true
+    L.threads[L.main].env = L.globals
+    names := TagMethodNames()
+    i = 0
+    while i < TM_COUNT { L.tm_names[i] = Intern(L, names[i]); i += 1 }
+    L.name_n = Intern(L, "n")
+    L.name_goto = Intern(L, "goto")
+    L.name_self = Intern(L, "self")
+    L.name_loaded = Intern(L, "_LOADED")
+    InternReserved(L)
+    L.open = true
+    OpenBase(L)
+    OpenString(L)
+    OpenTable(L)
+    OpenMath(L)
+    OpenOs(L)
+    OpenBit(L)
+    OpenCoroutine(L)
+    OpenDebug(L)
+    return true
+}
+
+TagMethodNames :: () -> [20]string {
+    names: [20]string
+    names[0] = "__index"
+    names[1] = "__newindex"
+    names[2] = "__gc"
+    names[3] = "__mode"
+    names[4] = "__eq"
+    names[5] = "__add"
+    names[6] = "__sub"
+    names[7] = "__mul"
+    names[8] = "__div"
+    names[9] = "__mod"
+    names[10] = "__pow"
+    names[11] = "__unm"
+    names[12] = "__len"
+    names[13] = "__lt"
+    names[14] = "__le"
+    names[15] = "__concat"
+    names[16] = "__call"
+    names[17] = "__tostring"
+    names[18] = "__metatable"
+    names[19] = "__name"
+    return names
+}
+
+// Run pending __gc finalizers and host finalizers, then free everything.
+LuaClose :: (L: *LuaState) {
+    if !L.open { return }
+    i: s64 = 0
+    while i < L.userdata.count {
+        if L.userdata[i].live && !L.userdata[i].finalized && L.userdata[i].meta >= 0 {
+            if FastTM(L, L.userdata[i].meta, TM_GC).t != LUA_TNIL { VecPush(L.pending_finalize, cast(s32) i) }
+        }
+        i += 1
+    }
+    VecResize(L.threads[L.main].frames, 0)
+    L.cur = L.main
+    RunFinalizers(L)
+    i = 0
+    while i < L.userdata.count {
+        if L.userdata[i].live { FreeUserdata(L, cast(s32) i) }
+        i += 1
+    }
+    VecFree(L.strings)
+    VecFree(L.string_free)
+    VecFree(L.intern)
+    VecFree(L.tables)
+    VecFree(L.table_free)
+    VecFree(L.closures)
+    VecFree(L.closure_free)
+    VecFree(L.protos)
+    VecFree(L.proto_free)
+    VecFree(L.boxes)
+    VecFree(L.box_free)
+    VecFree(L.userdata)
+    VecFree(L.userdata_free)
+    VecFree(L.threads)
+    VecFree(L.thread_free)
+    VecFree(L.ref_free)
+    VecFree(L.gray)
+    VecFree(L.weak)
+    VecFree(L.pending_finalize)
+    VecFree(L.resumers)
+    VecFree(L.file_root)
+    VecFree(L.env_allow)
+    VecFree(L.scratch)
+    VecFree(L.scratch2)
+    L.intern_used = 0
+    L.allocated = 0
+    L.open = false
+}
+
+LuaSetLimits :: (L: *LuaState, limits: LuaLimits) { L.limits = limits }
+LuaGetLimits :: (L: *LuaState) -> LuaLimits { return L.limits }
+
+// Call `hook` every `count` checkpoints (Lua calls and loop back-edges).
+// A hook returning false raises an error in the running Lua code; set its
+// message with LuaSetHookMessage first.
+LuaSetHook :: (L: *LuaState, hook: LuaHook, count: s64) {
+    L.hook = hook
+    L.hook_set = true
+    L.hook_count = count
+    L.hook_left = ifx count > 0 then count else 1000000000
+}
+
+LuaClearHook :: (L: *LuaState) {
+    L.hook_set = false
+    L.hook_left = 1000000000
+}
+
+LuaSetHookMessage :: (L: *LuaState, message: string) {
+    L.error = StringValue(Intern(L, message))
+}
+
+LuaSetPrintSink :: (L: *LuaState, sink: LuaPrintSink, context: *void) {
+    L.print_sink = sink
+    L.print_sink_set = true
+    L.print_context = context
+}
+
+// Let os.getenv read variables whose names start with `prefix` (none by
+// default, so os.getenv returns nil).
+LuaAllowEnvironment :: (L: *LuaState, prefix: string) {
+    if prefix.count == 0 { return }
+    if L.env_allow.count > 0 { VecPush(L.env_allow, 0) }
+    BuilderAppend(L.env_allow, prefix)
+}
+
+// Directory that dofile/loadfile/io.open may read below; empty (the
+// default) disables Lua-side file access.
+LuaSetFileRoot :: (L: *LuaState, path: string) {
+    VecClear(L.file_root)
+    BuilderAppend(L.file_root, path)
+}
+
+LuaSetHost :: (L: *LuaState, host: *void) { L.host = host }
+LuaHost :: (L: *LuaState) -> *void { return L.host }
+
+LuaCollectGarbage :: (L: *LuaState) {
+    th := L.cur
+    if L.threads[th].frames.count > 0 && !L.threads[th].frames[L.threads[th].frames.count - 1].native { return }
+    CollectGarbage(L)
+}
+
+// Estimated live heap bytes.
+LuaMemoryUsed :: (L: *LuaState) -> s64 { return L.allocated }
+
+// ---------------------------------------------------------------- stack
+
+LuaGetTop :: (L: *LuaState) -> s32 { return ArgCount(L) }
+
+LuaSetTop :: (L: *LuaState, index: s32) {
+    th := L.cur
+    base := StackBase(L)
+    if index >= 0 {
+        target := base + index
+        if target > L.threads[th].stack.count { GrowStack(L, th, target + 1) }
+        while L.threads[th].top < target {
+            L.threads[th].stack[L.threads[th].top] = NilValue()
+            L.threads[th].top += 1
+        }
+        L.threads[th].top = target
+    } else {
+        target := L.threads[th].top + index + 1
+        if target < base { target = base }
+        L.threads[th].top = target
+    }
+}
+
+LuaPop :: (L: *LuaState, n: s32) { LuaSetTop(L, -n - 1) }
+
+LuaCheckStack :: (L: *LuaState, extra: s32) -> bool {
+    return EnsureStack(L, Top(L) + extra + 1)
+}
+
+// A positive index for `index`, the same pseudo-index otherwise.
+LuaAbsIndex :: (L: *LuaState, index: s32) -> s32 {
+    if index > 0 || index <= LUA_REGISTRYINDEX { return index }
+    return cast(s32)(Top(L) - StackBase(L)) + index + 1
+}
+
+LuaPushValue :: (L: *LuaState, index: s32) { Push(L, IndexValue(L, index)) }
+
+LuaRemove :: (L: *LuaState, index: s32) {
+    position := Slot(L, index)
+    if position < 0 { return }
+    th := L.cur
+    while position + 1 < L.threads[th].top {
+        L.threads[th].stack[position] = L.threads[th].stack[position + 1]
+        position += 1
+    }
+    L.threads[th].top -= 1
+}
+
+LuaInsert :: (L: *LuaState, index: s32) {
+    position := Slot(L, index)
+    if position < 0 { return }
+    th := L.cur
+    v := L.threads[th].stack[L.threads[th].top - 1]
+    i := L.threads[th].top - 1
+    while i > position {
+        L.threads[th].stack[i] = L.threads[th].stack[i - 1]
+        i -= 1
+    }
+    L.threads[th].stack[position] = v
+}
+
+LuaReplace :: (L: *LuaState, index: s32) {
+    v := PopValue(L)
+    SetIndexValue(L, index, v)
+}
+
+// ---------------------------------------------------------------- reading
+
+LuaType :: (L: *LuaState, index: s32) -> s32 {
+    if index > LUA_REGISTRYINDEX && Slot(L, index) < 0 { return LUA_TYPE_NONE }
+    return PublicType(IndexValue(L, index))
+}
+
+LuaTypeName :: (L: *LuaState, type: s32) -> string {
+    if type == LUA_TYPE_NONE { return "no value" }
+    if type == LUA_TYPE_NIL { return "nil" }
+    if type == LUA_TYPE_BOOLEAN { return "boolean" }
+    if type == LUA_TYPE_NUMBER { return "number" }
+    if type == LUA_TYPE_STRING { return "string" }
+    if type == LUA_TYPE_TABLE { return "table" }
+    if type == LUA_TYPE_FUNCTION { return "function" }
+    if type == LUA_TYPE_THREAD { return "thread" }
+    return "userdata"
+}
+
+LuaIsNone :: (L: *LuaState, index: s32) -> bool { return LuaType(L, index) == LUA_TYPE_NONE }
+LuaIsNil :: (L: *LuaState, index: s32) -> bool { return IndexValue(L, index).t == LUA_TNIL }
+LuaIsNoneOrNil :: (L: *LuaState, index: s32) -> bool { return LuaType(L, index) <= LUA_TYPE_NIL }
+LuaIsBoolean :: (L: *LuaState, index: s32) -> bool { t := IndexValue(L, index).t; return t == LUA_TFALSE || t == LUA_TTRUE }
+LuaIsTable :: (L: *LuaState, index: s32) -> bool { return IndexValue(L, index).t == LUA_TTABLE }
+LuaIsFunction :: (L: *LuaState, index: s32) -> bool { return IndexValue(L, index).t == LUA_TFUNCTION }
+LuaIsUserdata :: (L: *LuaState, index: s32) -> bool { t := IndexValue(L, index).t; return t == LUA_TUSERDATA || t == LUA_TLIGHTUSERDATA }
+
+LuaIsNative :: (L: *LuaState, index: s32) -> bool {
+    v := IndexValue(L, index)
+    return v.t == LUA_TFUNCTION && L.closures[v.h].proto < 0
+}
+
+// Numbers and strings convertible to numbers.
+LuaIsNumber :: (L: *LuaState, index: s32) -> bool {
+    n, ok := ToNumber(L, IndexValue(L, index))
+    return ok
+}
+
+// Strings and numbers.
+LuaIsString :: (L: *LuaState, index: s32) -> bool { return IsStringLike(IndexValue(L, index)) }
+
+LuaToNumber :: (L: *LuaState, index: s32) -> float64 {
+    n, ok := ToNumber(L, IndexValue(L, index))
+    return ifx ok then n else 0.0
+}
+
+LuaToNumberChecked :: (L: *LuaState, index: s32) -> (value: float64, ok: bool) {
+    return ToNumber(L, IndexValue(L, index))
+}
+
+// The number truncated toward zero; 0 when it is not a number.
+LuaToInteger :: (L: *LuaState, index: s32) -> s64 {
+    n, ok := ToNumber(L, IndexValue(L, index))
+    if !ok || n != n { return 0 }
+    if n >= 9223372036854775807.0 { return 9223372036854775807 }
+    if n <= -9223372036854775808.0 { return -9223372036854775807 - 1 }
+    return SafeInteger(n)
+}
+
+LuaToBoolean :: (L: *LuaState, index: s32) -> bool { return Truthy(IndexValue(L, index)) }
+
+// String bytes of a string or number value (numbers are converted in place,
+// as lua_tolstring does). The view lasts while the value stays reachable.
+LuaToString :: (L: *LuaState, index: s32) -> (text: string, ok: bool) {
+    v := IndexValue(L, index)
+    if v.t == LUA_TSTRING { return StrView(L, v.h), true }
+    if v.t == LUA_TNUMBER {
+        h, ok := ToStringHandle(L, v)
+        SetIndexValue(L, index, StringValue(h))
+        return StrView(L, h), true
+    }
+    return "", false
+}
+
+// Raw length: string bytes, table border, 0 otherwise.
+LuaObjLen :: (L: *LuaState, index: s32) -> s64 {
+    v := IndexValue(L, index)
+    if v.t == LUA_TSTRING { return StrLen(L, v.h) }
+    if v.t == LUA_TTABLE { return TableLength(L, v.h) }
+    if v.t == LUA_TNUMBER {
+        buffer: Vec(u8)
+        AppendNumber(*buffer, v.n)
+        n := buffer.count
+        VecFree(buffer)
+        return n
+    }
+    return 0
+}
+
+LuaToUserdata :: (L: *LuaState, index: s32) -> *void {
+    v := IndexValue(L, index)
+    if v.t == LUA_TUSERDATA { return L.userdata[v.h].data }
+    if v.t == LUA_TLIGHTUSERDATA {
+        bits: NumberBits
+        bits.f = v.n
+        return cast(*void) bits.u
+    }
+    return null
+}
+
+LuaUserdataTag :: (L: *LuaState, index: s32) -> s64 {
+    v := IndexValue(L, index)
+    if v.t == LUA_TUSERDATA { return L.userdata[v.h].tag }
+    return 0
+}
+
+LuaRawEqual :: (L: *LuaState, a: s32, b: s32) -> bool {
+    return RawEqual(IndexValue(L, a), IndexValue(L, b))
+}
+
+// a == b with __eq; ok=false when a metamethod raised an error.
+LuaEqual :: (L: *LuaState, a: s32, b: s32) -> (equal: bool, ok: bool) {
+    result := false
+    ok := EqualValues(L, IndexValue(L, a), IndexValue(L, b), *result)
+    return result, ok
+}
+
+LuaLessThan :: (L: *LuaState, a: s32, b: s32) -> (less: bool, ok: bool) {
+    result := false
+    ok := LessThan(L, IndexValue(L, a), IndexValue(L, b), *result)
+    return result, ok
+}
+
+// ---------------------------------------------------------------- pushing
+
+LuaPushNil :: (L: *LuaState) { Push(L, NilValue()) }
+LuaPushNumber :: (L: *LuaState, n: float64) { Push(L, NumberValue(n)) }
+LuaPushInteger :: (L: *LuaState, n: s64) { Push(L, NumberValue(cast(float64) n)) }
+LuaPushBoolean :: (L: *LuaState, b: bool) { Push(L, BoolValue(b)) }
+LuaPushString :: (L: *LuaState, text: string) { Push(L, StringValue(Intern(L, text))) }
+
+LuaPushLightUserdata :: (L: *LuaState, data: *void) {
+    bits: NumberBits
+    bits.u = cast(u64) data
+    v: LuaValue
+    v.t = LUA_TLIGHTUSERDATA
+    v.n = bits.f
+    Push(L, v)
+}
+
+// Push a native function; `name` appears in error messages and tracebacks.
+LuaPushNative :: (L: *LuaState, fn: LuaNative, name: string) {
+    Push(L, FunctionValue(NewNative(L, fn, name)))
+}
+
+// Push a native closure taking the top `count` values as upvalues, read
+// back with LuaUpvalueIndex(1..count).
+LuaPushNativeClosure :: (L: *LuaState, fn: LuaNative, count: s32, name: string) {
+    h := NewNative(L, fn, name)
+    th := L.cur
+    first := L.threads[th].top - count
+    i: s64 = 0
+    while i < count {
+        VecPush(L.closures[h].native_upvals, L.threads[th].stack[first + i])
+        i += 1
+    }
+    L.threads[th].top = first
+    Push(L, FunctionValue(h))
+}
+
+// Push a full userdata wrapping host data. `tag` identifies the host type.
+LuaNewUserdata :: (L: *LuaState, data: *void, tag: s64) {
+    h := NewUserdataObject(L)
+    L.userdata[h].data = data
+    L.userdata[h].tag = tag
+    Push(L, ObjectValue(LUA_TUSERDATA, h))
+}
+
+// LuaNewUserdata with `finalizer` run when the userdata is collected or the
+// state closes (after any __gc metamethod).
+LuaNewUserdataFinalized :: (L: *LuaState, data: *void, tag: s64, finalizer: LuaFinalizer) {
+    h := NewUserdataObject(L)
+    L.userdata[h].data = data
+    L.userdata[h].tag = tag
+    L.userdata[h].finalizer = finalizer
+    L.userdata[h].has_finalizer = true
+    Push(L, ObjectValue(LUA_TUSERDATA, h))
+}
+
+LuaPushThreadValue :: (L: *LuaState) -> bool {
+    Push(L, ObjectValue(LUA_TTHREAD, L.cur))
+    return L.cur == L.main
+}
+
+// ---------------------------------------------------------------- tables
+
+LuaCreateTable :: (L: *LuaState, narr: s32, nrec: s32) { Push(L, TableValue(NewTable(L, narr, nrec))) }
+LuaNewTable :: (L: *LuaState) { Push(L, TableValue(NewTable(L, 0, 0))) }
+
+// t[k] with metamethods: pops the key, pushes the value.
+LuaGetTable :: (L: *LuaState, index: s32) -> bool {
+    t := IndexValue(L, index)
+    key := PopValue(L)
+    result: LuaValue
+    if !GetIndex(L, t, key, *result, -1) { return false }
+    Push(L, result)
+    return true
+}
+
+LuaGetField :: (L: *LuaState, index: s32, name: string) -> bool {
+    t := IndexValue(L, index)
+    result: LuaValue
+    if !GetIndex(L, t, StringValue(Intern(L, name)), *result, -1) { return false }
+    Push(L, result)
+    return true
+}
+
+LuaGetGlobal :: (L: *LuaState, name: string) -> bool { return LuaGetField(L, LUA_GLOBALSINDEX, name) }
+
+// t[k] = v with metamethods: pops the value and the key.
+LuaSetTable :: (L: *LuaState, index: s32) -> bool {
+    t := IndexValue(L, index)
+    value := PopValue(L)
+    key := PopValue(L)
+    return SetIndex(L, t, key, value, -1)
+}
+
+// t[name] = v: pops the value.
+LuaSetField :: (L: *LuaState, index: s32, name: string) -> bool {
+    t := IndexValue(L, index)
+    value := PopValue(L)
+    return SetIndex(L, t, StringValue(Intern(L, name)), value, -1)
+}
+
+LuaSetGlobal :: (L: *LuaState, name: string) -> bool { return LuaSetField(L, LUA_GLOBALSINDEX, name) }
+
+LuaRawGet :: (L: *LuaState, index: s32) {
+    t := IndexValue(L, index)
+    key := PopValue(L)
+    if t.t != LUA_TTABLE { Push(L, NilValue()); return }
+    Push(L, RawGet(L, t.h, key))
+}
+
+LuaRawGetI :: (L: *LuaState, index: s32, n: s64) {
+    t := IndexValue(L, index)
+    if t.t != LUA_TTABLE { Push(L, NilValue()); return }
+    Push(L, GetInt(L, t.h, n))
+}
+
+// Raw t[k] = v: pops value and key; false for a nil/NaN key or non-table.
+LuaRawSet :: (L: *LuaState, index: s32) -> bool {
+    t := IndexValue(L, index)
+    value := PopValue(L)
+    key := PopValue(L)
+    if t.t != LUA_TTABLE { return RuntimeError(L, "table expected") }
+    if !ValidKey(L, key) { return false }
+    RawSet(L, t.h, key, value)
+    return true
+}
+
+LuaRawSetI :: (L: *LuaState, index: s32, n: s64) {
+    t := IndexValue(L, index)
+    value := PopValue(L)
+    if t.t != LUA_TTABLE { return }
+    SetInt(L, t.h, n, value)
+}
+
+// lua_next: pops a key and pushes the next key and value. Returns 1 for a
+// pair, 0 at the end, -1 for an invalid key (error pending).
+LuaNext :: (L: *LuaState, index: s32) -> s32 {
+    t := IndexValue(L, index)
+    key := PopValue(L)
+    if t.t != LUA_TTABLE { return 0 }
+    k: LuaValue
+    v: LuaValue
+    found, ok := TableNext(L, t.h, key, *k, *v)
+    if !ok { ErrorText(L, "invalid key to 'next'"); return -1 }
+    if !found { return 0 }
+    Push(L, k)
+    Push(L, v)
+    return 1
+}
+
+// Push the metatable of a value; false (nothing pushed) when it has none.
+LuaGetMetatable :: (L: *LuaState, index: s32) -> bool {
+    mt := MetatableOf(L, IndexValue(L, index))
+    if mt < 0 { return false }
+    Push(L, TableValue(mt))
+    return true
+}
+
+// Pop a table (or nil) and make it the value's metatable.
+LuaSetMetatable :: (L: *LuaState, index: s32) -> bool {
+    v := IndexValue(L, index)
+    mt := PopValue(L)
+    h: s32 = -1
+    if mt.t == LUA_TTABLE { h = mt.h } else if mt.t != LUA_TNIL { return false }
+    if v.t == LUA_TTABLE { L.tables[v.h].meta = h; return true }
+    if v.t == LUA_TUSERDATA { L.userdata[v.h].meta = h; return true }
+    if v.t <= LUA_TLIGHTUSERDATA { L.type_meta[v.t] = h; if v.t == LUA_TFALSE { L.type_meta[LUA_TTRUE] = h } if v.t == LUA_TTRUE { L.type_meta[LUA_TFALSE] = h } return true }
+    return false
+}
+
+// luaL_newmetatable: registry[name] = new table (pushed); false when it
+// already existed (the existing one is pushed).
+LuaNewMetatable :: (L: *LuaState, name: string) -> bool {
+    key := Intern(L, name)
+    existing := GetStr(L, L.registry, key)
+    if existing.t != LUA_TNIL { Push(L, existing); return false }
+    t := NewTable(L, 0, 4)
+    SetStr(L, L.registry, key, TableValue(t))
+    Push(L, TableValue(t))
+    return true
+}
+
+LuaGetRegistryMetatable :: (L: *LuaState, name: string) {
+    Push(L, GetStr(L, L.registry, Intern(L, name)))
+}
+
+// The data of a userdata whose metatable is registry[name], else null.
+LuaTestUserdata :: (L: *LuaState, index: s32, name: string) -> *void {
+    v := IndexValue(L, index)
+    if v.t != LUA_TUSERDATA { return null }
+    expected := GetStr(L, L.registry, Intern(L, name))
+    if expected.t != LUA_TTABLE || L.userdata[v.h].meta != expected.h { return null }
+    return L.userdata[v.h].data
+}
+
+// Push the environment table of a function, userdata or thread.
+LuaGetFenv :: (L: *LuaState, index: s32) {
+    v := IndexValue(L, index)
+    if v.t == LUA_TFUNCTION { Push(L, TableValue(L.closures[v.h].env)); return }
+    if v.t == LUA_TUSERDATA && L.userdata[v.h].env >= 0 { Push(L, TableValue(L.userdata[v.h].env)); return }
+    if v.t == LUA_TTHREAD { Push(L, TableValue(L.threads[v.h].env)); return }
+    Push(L, NilValue())
+}
+
+// Pop a table and make it the environment of the value at index.
+LuaSetFenv :: (L: *LuaState, index: s32) -> bool {
+    v := IndexValue(L, index)
+    env := PopValue(L)
+    if env.t != LUA_TTABLE { return false }
+    if v.t == LUA_TFUNCTION { L.closures[v.h].env = env.h; return true }
+    if v.t == LUA_TUSERDATA { L.userdata[v.h].env = env.h; return true }
+    if v.t == LUA_TTHREAD { L.threads[v.h].env = env.h; return true }
+    return false
+}
+
+// ---------------------------------------------------------------- calls
+
+// Call the function below `nargs` arguments, leaving `want` results
+// (LUA_MULTRET for all). Unprotected: inside a native, return
+// LUA_NATIVE_ERROR when this fails.
+LuaCall :: (L: *LuaState, nargs: s32, want: s32) -> bool {
+    func := Top(L) - nargs - 1
+    return CallValue(L, func, nargs, want)
+}
+
+// Protected call. `handler` is a stack index of an error function (0 for
+// none). On error the message replaces the function and arguments.
+LuaPCall :: (L: *LuaState, nargs: s32, want: s32, handler: s32) -> s32 {
+    func := Top(L) - nargs - 1
+    h := NilValue()
+    if handler != 0 { h = IndexValue(L, handler) }
+    status := ProtectedCall(L, func, nargs, want, h)
+    if status != LUA_OK {
+        th := L.cur
+        L.threads[th].top = func
+        Push(L, L.error)
+        L.error = NilValue()
+    }
+    return status
+}
+
+// Compile a chunk and push it as a function (or push the error message).
+LuaLoadBuffer :: (L: *LuaState, text: string, chunkname: string) -> s32 {
+    return LoadChunk(L, text, chunkname, -1)
+}
+
+LuaLoadString :: (L: *LuaState, text: string) -> s32 { return LoadChunk(L, text, text, -1) }
+
+// Load and run a chunk; errors carry a traceback. The message stays on the
+// stack when the status is not LUA_OK.
+LuaDoString :: (L: *LuaState, text: string, chunkname: string) -> s32 {
+    status := LoadChunk(L, text, chunkname, -1)
+    if status != LUA_OK { return status }
+    return CallWithTraceback(L, 0, LUA_MULTRET)
+}
+
+// LuaPCall with debug.traceback as the error handler.
+CallWithTraceback :: (L: *LuaState, nargs: s32, want: s32) -> s32 {
+    func := Top(L) - nargs - 1
+    handler := FunctionValue(NewNative(L, TracebackHandler, "traceback"))
+    status := ProtectedCall(L, func, nargs, want, handler)
+    if status != LUA_OK {
+        L.threads[L.cur].top = func
+        Push(L, L.error)
+        L.error = NilValue()
+    }
+    return status
+}
+
+// Read and run a file from the host file system (not limited by the file
+// root, which only applies to Lua's dofile/loadfile).
+LuaDoFile :: (L: *LuaState, path: string) -> s32 {
+    status := LuaLoadFile(L, path)
+    if status != LUA_OK { return status }
+    return CallWithTraceback(L, 0, LUA_MULTRET)
+}
+
+LuaLoadFile :: (L: *LuaState, path: string) -> s32 {
+    bytes: Vec(u8)
+    if !ReadFileInto(path, *bytes) {
+        VecFree(bytes)
+        message: Vec(u8)
+        BuilderAppend(message, "cannot open ")
+        BuilderAppend(message, path)
+        Push(L, StringValue(InternBytes(L, *message)))
+        VecFree(message)
+        return LUA_ERRFILE
+    }
+    name: Vec(u8)
+    VecPush(name, #char "@")
+    BuilderAppend(name, path)
+    status := LoadChunk(L, BytesView(*bytes), BytesView(*name), -1)
+    VecFree(name)
+    VecFree(bytes)
+    return status
+}
+
+// ---------------------------------------------------------------- errors
+
+// Raise the value on top of the stack. Return this from a native.
+LuaRaiseError :: (L: *LuaState) -> s32 {
+    SetError(L, PopValue(L))
+    return LUA_NATIVE_ERROR
+}
+
+// Raise "chunk:line: message" positioned at the Lua caller of the native.
+LuaErrorText :: (L: *LuaState, message: string) -> s32 {
+    text: Vec(u8)
+    AppendWhere(L, *text, 1)
+    BuilderAppend(text, message)
+    SetError(L, StringValue(InternBytes(L, *text)))
+    VecFree(text)
+    return LUA_NATIVE_ERROR
+}
+
+// "bad argument #n to 'name' (message)".
+LuaArgError :: (L: *LuaState, n: s32, message: string) -> s32 {
+    text: Vec(u8)
+    BuilderAppend(text, "bad argument #")
+    Append(*text, cast(s64) n)
+    BuilderAppend(text, " to '")
+    BuilderAppend(text, NativeName(L))
+    BuilderAppend(text, "' (")
+    BuilderAppend(text, message)
+    VecPush(text, #char ")")
+    result := LuaErrorText(L, BytesView(*text))
+    VecFree(text)
+    return result
+}
+
+// "bad argument #n to 'name' (expected expected, got actual)".
+LuaTypeError :: (L: *LuaState, n: s32, expected: string) -> s32 {
+    text: Vec(u8)
+    BuilderAppend(text, expected)
+    BuilderAppend(text, " expected, got ")
+    v := Arg(L, n)
+    BuilderAppend(text, ifx n > ArgCount(L) then "no value" else TypeNameOf(v.t))
+    result := LuaArgError(L, n, BytesView(*text))
+    VecFree(text)
+    return result
+}
+
+// Argument checks for natives: ok=false means an error is pending and the
+// native should return LUA_NATIVE_ERROR.
+LuaCheckNumber :: (L: *LuaState, n: s32) -> (value: float64, ok: bool) {
+    value, ok := ToNumber(L, Arg(L, n))
+    if !ok { LuaTypeError(L, n, "number"); return 0.0, false }
+    return value, true
+}
+
+LuaCheckInteger :: (L: *LuaState, n: s32) -> (value: s64, ok: bool) {
+    value, ok := ToNumber(L, Arg(L, n))
+    if !ok { LuaTypeError(L, n, "number"); return 0, false }
+    return SafeInteger(value), true
+}
+
+LuaOptNumber :: (L: *LuaState, n: s32, fallback: float64) -> (value: float64, ok: bool) {
+    if Arg(L, n).t == LUA_TNIL { return fallback, true }
+    return LuaCheckNumber(L, n)
+}
+
+LuaOptInteger :: (L: *LuaState, n: s32, fallback: s64) -> (value: s64, ok: bool) {
+    if Arg(L, n).t == LUA_TNIL { return fallback, true }
+    return LuaCheckInteger(L, n)
+}
+
+LuaCheckString :: (L: *LuaState, n: s32) -> (text: string, ok: bool) {
+    v := Arg(L, n)
+    if v.t == LUA_TSTRING { return StrView(L, v.h), true }
+    if v.t == LUA_TNUMBER {
+        h, converted := ToStringHandle(L, v)
+        L.threads[L.cur].stack[StackBase(L) + n - 1] = StringValue(h)
+        return StrView(L, h), true
+    }
+    LuaTypeError(L, n, "string")
+    return "", false
+}
+
+LuaOptString :: (L: *LuaState, n: s32, fallback: string) -> (text: string, ok: bool) {
+    if Arg(L, n).t == LUA_TNIL { return fallback, true }
+    return LuaCheckString(L, n)
+}
+
+LuaCheckTable :: (L: *LuaState, n: s32) -> bool {
+    if Arg(L, n).t == LUA_TTABLE { return true }
+    LuaTypeError(L, n, "table")
+    return false
+}
+
+LuaCheckAny :: (L: *LuaState, n: s32) -> bool {
+    if n <= ArgCount(L) { return true }
+    LuaArgError(L, n, "value expected")
+    return false
+}
+
+// Push "message\nstack traceback:..." for the running thread.
+LuaTraceback :: (L: *LuaState, message: string, level: s32) {
+    text: Vec(u8)
+    if message.count > 0 {
+        BuilderAppend(text, message)
+        VecPush(text, 10)
+    }
+    AppendTraceback(L, *text, L.cur, level)
+    Push(L, StringValue(InternBytes(L, *text)))
+    VecFree(text)
+}
+
+// ---------------------------------------------------------------- refs
+
+// Pop the top value into the registry and return a handle for it.
+LuaRef :: (L: *LuaState) -> s32 {
+    v := PopValue(L)
+    if v.t == LUA_TNIL { return LUA_REFNIL }
+    ref: s32 = 0
+    if L.ref_free.count > 0 {
+        ref = L.ref_free[L.ref_free.count - 1]
+        VecResize(L.ref_free, L.ref_free.count - 1)
+    } else {
+        ref = cast(s32)(L.tables[L.registry].arr.count + 1)
+    }
+    SetInt(L, L.registry, ref, v)
+    return ref
+}
+
+LuaUnref :: (L: *LuaState, ref: s32) {
+    if ref <= 0 { return }
+    SetInt(L, L.registry, ref, BoolValue(false))
+    VecPush(L.ref_free, ref)
+}
+
+LuaPushRef :: (L: *LuaState, ref: s32) {
+    if ref <= 0 { Push(L, NilValue()); return }
+    Push(L, GetInt(L, L.registry, ref))
+}
+
+// ---------------------------------------------------------------- registration
+
+// globals[name] = native.
+LuaRegister :: (L: *LuaState, name: string, fn: LuaNative) {
+    SetStr(L, L.threads[L.cur].env, Intern(L, name), FunctionValue(NewNative(L, fn, name)))
+}
+
+// t[name] = native for the table at index.
+LuaSetNative :: (L: *LuaState, index: s32, name: string, fn: LuaNative) {
+    t := IndexValue(L, index)
+    if t.t != LUA_TTABLE { return }
+    SetStr(L, t.h, Intern(L, name), FunctionValue(NewNative(L, fn, name)))
+}
+
+// ---------------------------------------------------------------- threads
+
+// Push a new coroutine running the function on top of the stack (popped).
+LuaNewThread :: (L: *LuaState) {
+    f := PopValue(L)
+    co := NewThreadObject(L)
+    L.threads[co].stack[0] = f
+    L.threads[co].top = 1
+    L.threads[co].env = L.threads[L.cur].env
+    Push(L, ObjectValue(LUA_TTHREAD, co))
+}
+
+// Resume the coroutine at `index` with the top `nargs` values; its results
+// (or error message) replace them. Returns LUA_OK when it finished,
+// LUA_YIELD when it yielded, an error status otherwise.
+LuaResume :: (L: *LuaState, index: s32, nargs: s32) -> (status: s32, count: s32) {
+    v := IndexValue(L, index)
+    if v.t != LUA_TTHREAD {
+        L.threads[L.cur].top -= nargs
+        Push(L, StringValue(Intern(L, "not a coroutine")))
+        return LUA_ERRRUN, 1
+    }
+    return ResumeThread(L, v.h, nargs)
+}
+
+// Yield the top `n` values from a native: `return LuaYield(L, n)`. The
+// resume arguments become the native call's results.
+LuaYield :: (L: *LuaState, n: s32) -> s32 {
+    th := L.cur
+    if th == L.main { return LuaErrorText(L, "attempt to yield from outside a coroutine") }
+    if L.threads[th].nesting > 0 { return LuaErrorText(L, "attempt to yield across metamethod/C-call boundary") }
+    base := StackBase(L)
+    top := L.threads[th].top
+    count := cast(s64) n
+    if count > top - base { count = top - base }
+    i: s64 = 0
+    while i < count {
+        L.threads[th].stack[base + i] = L.threads[th].stack[top - count + i]
+        i += 1
+    }
+    L.threads[th].top = base + count
+    return LUA_NATIVE_YIELD
+}

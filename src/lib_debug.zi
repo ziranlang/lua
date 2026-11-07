@@ -1,0 +1,299 @@
+// The debug library subset mods use: traceback, getinfo, locals and
+// upvalues, raw metatables, the registry and inert hooks.
+
+#scope_module
+
+// An optional thread first argument: the thread and the argument shift.
+ThreadArg :: (L: *LuaState) -> (thread: s32, shift: s32) {
+    v := Arg(L, 1)
+    if v.t == LUA_TTHREAD { return v.h, 1 }
+    return L.cur, 0
+}
+
+DebugTraceback :: (L: *LuaState) -> s32 {
+    thread, shift := ThreadArg(L)
+    message := Arg(L, 1 + shift)
+    if message.t != LUA_TNIL && !IsStringLike(message) { return ReturnValue(L, message) }
+    fallback: s64 = ifx thread == L.cur then 1 else 0
+    level, ok := LuaOptInteger(L, 2 + shift, fallback)
+    if !ok { return LUA_NATIVE_ERROR }
+    text: Vec(u8)
+    if message.t == LUA_TSTRING {
+        BuilderAppend(text, StrView(L, message.h))
+        VecPush(text, 10)
+    } else if message.t == LUA_TNUMBER {
+        AppendNumber(*text, message.n)
+        VecPush(text, 10)
+    }
+    if level < 0 { level = 0 }
+    AppendTraceback(L, *text, thread, cast(s32) level)
+    Push(L, StringValue(InternBytes(L, *text)))
+    VecFree(text)
+    return 1
+}
+
+// Error handler for CallWithTraceback: message plus the stack below it.
+TracebackHandler :: (L: *LuaState) -> s32 {
+    message := Arg(L, 1)
+    if message.t != LUA_TNIL && !IsStringLike(message) { return ReturnValue(L, message) }
+    text: Vec(u8)
+    if message.t == LUA_TSTRING {
+        BuilderAppend(text, StrView(L, message.h))
+    } else if message.t == LUA_TNUMBER {
+        AppendNumber(*text, message.n)
+    } else {
+        BuilderAppend(text, "(error object is nil)")
+    }
+    VecPush(text, 10)
+    AppendTraceback(L, *text, L.cur, 1)
+    Push(L, StringValue(InternBytes(L, *text)))
+    VecFree(text)
+    return 1
+}
+
+HasOption :: (what: string, c: u8) -> bool {
+    i: s64 = 0
+    while i < what.count {
+        if what[i] == c { return true }
+        i += 1
+    }
+    return false
+}
+
+// Fill the info table for closure cl, with frame details when frame >= 0.
+FillInfo :: (L: *LuaState, t: s32, what: string, cl: s32, thread: s32, frame: s64) {
+    p := L.closures[cl].proto
+    if HasOption(what, #char "S") {
+        if p < 0 {
+            SetValue(L, t, "source", StringValue(Intern(L, "=[C]")))
+            SetValue(L, t, "short_src", StringValue(Intern(L, "[C]")))
+            SetValue(L, t, "what", StringValue(Intern(L, "C")))
+            SetValue(L, t, "linedefined", NumberValue(-1.0))
+            SetValue(L, t, "lastlinedefined", NumberValue(-1.0))
+        } else {
+            source := L.protos[p].source
+            SetValue(L, t, "source", ifx source >= 0 then StringValue(source) else StringValue(Intern(L, "=?")))
+            short: Vec(u8)
+            AppendChunkId(L, *short, source)
+            SetValue(L, t, "short_src", StringValue(InternBytes(L, *short)))
+            VecFree(short)
+            main := L.protos[p].line_defined == 0
+            SetValue(L, t, "what", StringValue(Intern(L, ifx main then "main" else "Lua")))
+            SetValue(L, t, "linedefined", NumberValue(cast(float64) L.protos[p].line_defined))
+            SetValue(L, t, "lastlinedefined", NumberValue(cast(float64)(ifx main then -1 else L.protos[p].last_line)))
+        }
+    }
+    if HasOption(what, #char "l") {
+        line: s32 = -1
+        if frame >= 0 { line = FrameLine(L, thread, frame) }
+        SetValue(L, t, "currentline", NumberValue(cast(float64) line))
+    }
+    if HasOption(what, #char "u") {
+        n := ifx p < 0 then L.closures[cl].native_upvals.count else L.closures[cl].upvals.count
+        SetValue(L, t, "nups", NumberValue(cast(float64) n))
+    }
+    if HasOption(what, #char "n") && frame >= 0 {
+        kind, name := FrameFunctionName(L, thread, frame)
+        if kind != NAME_NONE {
+            if name == -2 {
+                SetValue(L, t, "name", StringValue(Intern(L, "for iterator")))
+                SetValue(L, t, "namewhat", StringValue(Intern(L, "for iterator")))
+            } else {
+                SetValue(L, t, "name", StringValue(name))
+                SetValue(L, t, "namewhat", StringValue(Intern(L, NameKindText(kind))))
+            }
+        } else {
+            SetValue(L, t, "namewhat", StringValue(Intern(L, "")))
+        }
+    }
+    if HasOption(what, #char "f") { SetValue(L, t, "func", FunctionValue(cl)) }
+}
+
+DebugGetinfo :: (L: *LuaState) -> s32 {
+    thread, shift := ThreadArg(L)
+    what, ok := LuaOptString(L, 2 + shift, "flnSu")
+    if !ok { return LUA_NATIVE_ERROR }
+    target := Arg(L, 1 + shift)
+    if what.count > 0 && what[0] == #char ">" { what = what[1:] }
+    t := NewTable(L, 0, 12)
+    if target.t == LUA_TFUNCTION {
+        FillInfo(L, t, what, target.h, thread, -1)
+        return ReturnValue(L, TableValue(t))
+    }
+    if target.t != LUA_TNUMBER { return LuaArgError(L, 1 + shift, "function or level expected") }
+    level := SafeInteger(target.n)
+    // Level 0 is getinfo itself on the running thread.
+    frame := L.threads[thread].frames.count - 1 - level
+    if level < 0 || frame < 0 { return ReturnNil(L) }
+    FillInfo(L, t, what, L.threads[thread].frames[frame].closure, thread, frame)
+    return ReturnValue(L, TableValue(t))
+}
+
+Unbox :: (L: *LuaState, v: LuaValue) -> LuaValue #inline {
+    if v.t == LUA_TBOX { return L.boxes[v.h].value }
+    return v
+}
+
+// The n-th active local of the frame: register and name, or -1.
+ActiveLocal :: (L: *LuaState, thread: s32, frame: s64, n: s64) -> (reg: s32, name: s32) {
+    if L.threads[thread].frames[frame].native { return -1, -1 }
+    cl := L.threads[thread].frames[frame].closure
+    p := L.closures[cl].proto
+    pc := cast(s64) L.threads[thread].frames[frame].pc - 1
+    if pc < 0 { pc = 0 }
+    count: s64 = 0
+    i: s64 = 0
+    while i < L.protos[p].locvars.count {
+        lv := L.protos[p].locvars[i]
+        if lv.start_pc > pc { break }
+        if lv.end_pc < 0 || pc < lv.end_pc {
+            count += 1
+            if count == n { return lv.reg, lv.name }
+        }
+        i += 1
+    }
+    return -1, -1
+}
+
+LocalFrame :: (L: *LuaState, thread: s32, level: s64) -> s64 {
+    frame := L.threads[thread].frames.count - 1 - level
+    if level < 0 || frame < 0 { return -1 }
+    return frame
+}
+
+DebugGetlocal :: (L: *LuaState) -> s32 {
+    thread, shift := ThreadArg(L)
+    level, ok1 := LuaCheckInteger(L, 1 + shift)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    n, ok2 := LuaCheckInteger(L, 2 + shift)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    frame := LocalFrame(L, thread, level)
+    if frame < 0 { return LuaArgError(L, 1 + shift, "level out of range") }
+    reg, name := ActiveLocal(L, thread, frame, n)
+    if reg < 0 { return ReturnNil(L) }
+    base := L.threads[thread].frames[frame].base
+    Push(L, StringValue(name))
+    Push(L, Unbox(L, L.threads[thread].stack[base + reg]))
+    return 2
+}
+
+DebugSetlocal :: (L: *LuaState) -> s32 {
+    thread, shift := ThreadArg(L)
+    level, ok1 := LuaCheckInteger(L, 1 + shift)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    n, ok2 := LuaCheckInteger(L, 2 + shift)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    frame := LocalFrame(L, thread, level)
+    if frame < 0 { return LuaArgError(L, 1 + shift, "level out of range") }
+    reg, name := ActiveLocal(L, thread, frame, n)
+    if reg < 0 { return ReturnNil(L) }
+    slot := L.threads[thread].frames[frame].base + reg
+    value := Arg(L, 3 + shift)
+    current := L.threads[thread].stack[slot]
+    if current.t == LUA_TBOX { L.boxes[current.h].value = value } else { L.threads[thread].stack[slot] = value }
+    return ReturnValue(L, StringValue(name))
+}
+
+DebugGetupvalue :: (L: *LuaState) -> s32 {
+    f := Arg(L, 1)
+    if f.t != LUA_TFUNCTION { return LuaTypeError(L, 1, "function") }
+    n, ok := LuaCheckInteger(L, 2)
+    if !ok { return LUA_NATIVE_ERROR }
+    cl := f.h
+    p := L.closures[cl].proto
+    if p < 0 {
+        if n < 1 || n > L.closures[cl].native_upvals.count { return 0 }
+        Push(L, StringValue(Intern(L, "")))
+        Push(L, L.closures[cl].native_upvals[n - 1])
+        return 2
+    }
+    if n < 1 || n > L.closures[cl].upvals.count { return 0 }
+    name := ifx n <= L.protos[p].upval_names.count then L.protos[p].upval_names[n - 1] else -1
+    Push(L, ifx name >= 0 then StringValue(name) else StringValue(Intern(L, "?")))
+    Push(L, L.boxes[L.closures[cl].upvals[n - 1]].value)
+    return 2
+}
+
+DebugSetupvalue :: (L: *LuaState) -> s32 {
+    f := Arg(L, 1)
+    if f.t != LUA_TFUNCTION { return LuaTypeError(L, 1, "function") }
+    n, ok := LuaCheckInteger(L, 2)
+    if !ok { return LUA_NATIVE_ERROR }
+    if !LuaCheckAny(L, 3) { return LUA_NATIVE_ERROR }
+    cl := f.h
+    p := L.closures[cl].proto
+    value := Arg(L, 3)
+    if p < 0 {
+        if n < 1 || n > L.closures[cl].native_upvals.count { return 0 }
+        L.closures[cl].native_upvals[n - 1] = value
+        return ReturnValue(L, StringValue(Intern(L, "")))
+    }
+    if n < 1 || n > L.closures[cl].upvals.count { return 0 }
+    L.boxes[L.closures[cl].upvals[n - 1]].value = value
+    name := ifx n <= L.protos[p].upval_names.count then L.protos[p].upval_names[n - 1] else -1
+    return ReturnValue(L, ifx name >= 0 then StringValue(name) else StringValue(Intern(L, "?")))
+}
+
+DebugGetmetatable :: (L: *LuaState) -> s32 {
+    if !LuaCheckAny(L, 1) { return LUA_NATIVE_ERROR }
+    mt := MetatableOf(L, Arg(L, 1))
+    if mt < 0 { return ReturnNil(L) }
+    return ReturnValue(L, TableValue(mt))
+}
+
+DebugSetmetatable :: (L: *LuaState) -> s32 {
+    v := Arg(L, 1)
+    m := Arg(L, 2)
+    if m.t != LUA_TNIL && m.t != LUA_TTABLE { return LuaArgError(L, 2, "nil or table expected") }
+    mt: s32 = ifx m.t == LUA_TTABLE then m.h else -1
+    if v.t == LUA_TTABLE {
+        L.tables[v.h].meta = mt
+    } else if v.t == LUA_TUSERDATA {
+        L.userdata[v.h].meta = mt
+    } else if v.t < 11 {
+        L.type_meta[v.t] = mt
+    }
+    return ReturnValue(L, BoolValue(true))
+}
+
+DebugGetregistry :: (L: *LuaState) -> s32 { return ReturnValue(L, TableValue(L.registry)) }
+
+DebugGetfenv :: (L: *LuaState) -> s32 {
+    v := Arg(L, 1)
+    if v.t == LUA_TFUNCTION && L.closures[v.h].env >= 0 { return ReturnValue(L, TableValue(L.closures[v.h].env)) }
+    if v.t == LUA_TUSERDATA && L.userdata[v.h].env >= 0 { return ReturnValue(L, TableValue(L.userdata[v.h].env)) }
+    if v.t == LUA_TTHREAD && L.threads[v.h].env >= 0 { return ReturnValue(L, TableValue(L.threads[v.h].env)) }
+    return ReturnNil(L)
+}
+
+DebugSetfenv :: (L: *LuaState) -> s32 {
+    v := Arg(L, 1)
+    e := Arg(L, 2)
+    if e.t != LUA_TTABLE { return LuaTypeError(L, 2, "table") }
+    if v.t == LUA_TFUNCTION { L.closures[v.h].env = e.h }
+    else if v.t == LUA_TUSERDATA { L.userdata[v.h].env = e.h }
+    else if v.t == LUA_TTHREAD { L.threads[v.h].env = e.h }
+    else { return LuaErrorText(L, "'setfenv' cannot change environment of given object") }
+    return ReturnValue(L, v)
+}
+
+DebugSethook :: (L: *LuaState) -> s32 { return 0 }
+DebugGethook :: (L: *LuaState) -> s32 { return ReturnNil(L) }
+
+OpenDebug :: (L: *LuaState) {
+    t := NewTable(L, 0, 16)
+    RegisterLibrary(L, "debug", t)
+    SetNative(L, t, "traceback", DebugTraceback)
+    SetNative(L, t, "getinfo", DebugGetinfo)
+    SetNative(L, t, "getlocal", DebugGetlocal)
+    SetNative(L, t, "setlocal", DebugSetlocal)
+    SetNative(L, t, "getupvalue", DebugGetupvalue)
+    SetNative(L, t, "setupvalue", DebugSetupvalue)
+    SetNative(L, t, "getmetatable", DebugGetmetatable)
+    SetNative(L, t, "setmetatable", DebugSetmetatable)
+    SetNative(L, t, "getregistry", DebugGetregistry)
+    SetNative(L, t, "getfenv", DebugGetfenv)
+    SetNative(L, t, "setfenv", DebugSetfenv)
+    SetNative(L, t, "sethook", DebugSethook)
+    SetNative(L, t, "gethook", DebugGethook)
+}

@@ -1,0 +1,289 @@
+// Math library of Lua 5.1 on Ziran's std/math, with LuaJIT's math.log base.
+
+#scope_module
+
+PI :: 3.141592653589793;
+
+NumberArg :: (L: *LuaState, n: s32) -> (value: float64, ok: bool) #inline {
+    return LuaCheckNumber(L, n)
+}
+
+ReturnNumber :: (L: *LuaState, x: float64) -> s32 #inline {
+    Push(L, NumberValue(x))
+    return 1
+}
+
+MathAbs :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, ifx x < 0.0 then -x else (ifx x == 0.0 then 0.0 else x))
+}
+MathCeil :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Ceil(x))
+}
+MathFloor :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Floor(x))
+}
+MathSqrt :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Sqrt(x))
+}
+MathSin :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Sin(x))
+}
+MathCos :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Cos(x))
+}
+MathTan :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Tan(x))
+}
+MathAsin :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Asin(x))
+}
+MathAcos :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Acos(x))
+}
+MathAtan :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Atan(x))
+}
+MathAtan2 :: (L: *LuaState) -> s32 {
+    y, ok1 := NumberArg(L, 1)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    x, ok2 := NumberArg(L, 2)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Atan2(y, x))
+}
+MathSinh :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Sinh(x))
+}
+MathCosh :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Cosh(x))
+}
+MathTanh :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Tanh(x))
+}
+MathExp :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Exp(x))
+}
+MathLog :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    if Arg(L, 2).t == LUA_TNIL { return ReturnNumber(L, Log(x)) }
+    base, ok2 := NumberArg(L, 2)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    if base == 2.0 { return ReturnNumber(L, Log2(x)) }
+    if base == 10.0 { return ReturnNumber(L, Log10(x)) }
+    return ReturnNumber(L, Log(x) / Log(base))
+}
+MathLog10 :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Log10(x))
+}
+MathPow :: (L: *LuaState) -> s32 {
+    x, ok1 := NumberArg(L, 1)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    y, ok2 := NumberArg(L, 2)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, LuaPow(x, y))
+}
+MathFmod :: (L: *LuaState) -> s32 {
+    x, ok1 := NumberArg(L, 1)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    y, ok2 := NumberArg(L, 2)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, Fmod(x, y))
+}
+MathModf :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    if x == Infinity() || x == -Infinity() {
+        Push(L, NumberValue(x))
+        Push(L, NumberValue(0.0))
+        return 2
+    }
+    whole := Trunc(x)
+    Push(L, NumberValue(whole))
+    Push(L, NumberValue(ifx x != x then x else x - whole))
+    return 2
+}
+MathFrexp :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    if x == 0.0 || x != x || x == Infinity() || x == -Infinity() {
+        Push(L, NumberValue(x))
+        Push(L, NumberValue(0.0))
+        return 2
+    }
+    bits: NumberBits
+    bits.f = x
+    exponent := cast(s64)((bits.u >> 52) & 2047)
+    adjust: s64 = 0
+    if exponent == 0 {
+        // Subnormal: scale into the normal range first.
+        bits.f = x * 18014398509481984.0
+        exponent = cast(s64)((bits.u >> 52) & 2047)
+        adjust = -54
+    }
+    bits.u = (bits.u & ~(cast(u64) 2047 << 52)) | (cast(u64) 1022 << 52)
+    Push(L, NumberValue(bits.f))
+    Push(L, NumberValue(cast(float64)(exponent - 1022 + adjust)))
+    return 2
+}
+MathLdexp :: (L: *LuaState) -> s32 {
+    x, ok1 := NumberArg(L, 1)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    e, ok2 := LuaCheckInteger(L, 2)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    if e > 4096 { e = 4096 }
+    if e < -4096 { e = -4096 }
+    return ReturnNumber(L, ScaleByPowerOfTwo(x, cast(s32) e))
+}
+MathDeg :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, x * (180.0 / PI))
+}
+MathRad :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    return ReturnNumber(L, x * (PI / 180.0))
+}
+MathMin :: (L: *LuaState) -> s32 {
+    n := ArgCount(L)
+    best, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    i: s32 = 2
+    while i <= n {
+        x, okx := NumberArg(L, i)
+        if !okx { return LUA_NATIVE_ERROR }
+        if x < best { best = x }
+        i += 1
+    }
+    return ReturnNumber(L, best)
+}
+MathMax :: (L: *LuaState) -> s32 {
+    n := ArgCount(L)
+    best, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    i: s32 = 2
+    while i <= n {
+        x, okx := NumberArg(L, i)
+        if !okx { return LUA_NATIVE_ERROR }
+        if x > best { best = x }
+        i += 1
+    }
+    return ReturnNumber(L, best)
+}
+
+// xorshift64* state lives in the LuaState.
+RandomNext :: (L: *LuaState) -> float64 {
+    x := L.random_state
+    if x == 0 { x = 0x9E3779B97F4A7C15 }
+    x ^= x >> 12
+    x ^= x << 25
+    x ^= x >> 27
+    L.random_state = x
+    r := x * 0x2545F4914F6CDD1D
+    // 53 random bits into [0, 1).
+    return cast(float64)(r >> 11) * (1.0 / 9007199254740992.0)
+}
+
+MathRandom :: (L: *LuaState) -> s32 {
+    r := RandomNext(L)
+    n := ArgCount(L)
+    if n == 0 { return ReturnNumber(L, r) }
+    if n == 1 {
+        u, ok := NumberArg(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        u = Floor(u)
+        if u < 1.0 { return LuaArgError(L, 1, "interval is empty") }
+        return ReturnNumber(L, Floor(r * u) + 1.0)
+    }
+    if n == 2 {
+        l, ok1 := NumberArg(L, 1)
+        if !ok1 { return LUA_NATIVE_ERROR }
+        u, ok2 := NumberArg(L, 2)
+        if !ok2 { return LUA_NATIVE_ERROR }
+        l = Floor(l)
+        u = Floor(u)
+        if l > u { return LuaArgError(L, 2, "interval is empty") }
+        return ReturnNumber(L, Floor(r * (u - l + 1.0)) + l)
+    }
+    return LuaErrorText(L, "wrong number of arguments")
+}
+
+MathRandomSeed :: (L: *LuaState) -> s32 {
+    x, ok := NumberArg(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    bits: NumberBits
+    bits.f = x
+    L.random_state = MixHash(bits.u ^ 0x9E3779B97F4A7C15)
+    if L.random_state == 0 { L.random_state = 1 }
+    // Discard a few values like LuaJIT does after seeding.
+    i := 0
+    while i < 10 { RandomNext(L); i += 1 }
+    return 0
+}
+
+OpenMath :: (L: *LuaState) {
+    t := NewTable(L, 0, 32)
+    RegisterLibrary(L, "math", t)
+    SetNative(L, t, "abs", MathAbs)
+    SetNative(L, t, "ceil", MathCeil)
+    SetNative(L, t, "floor", MathFloor)
+    SetNative(L, t, "sqrt", MathSqrt)
+    SetNative(L, t, "sin", MathSin)
+    SetNative(L, t, "cos", MathCos)
+    SetNative(L, t, "tan", MathTan)
+    SetNative(L, t, "asin", MathAsin)
+    SetNative(L, t, "acos", MathAcos)
+    SetNative(L, t, "atan", MathAtan)
+    SetNative(L, t, "atan2", MathAtan2)
+    SetNative(L, t, "sinh", MathSinh)
+    SetNative(L, t, "cosh", MathCosh)
+    SetNative(L, t, "tanh", MathTanh)
+    SetNative(L, t, "exp", MathExp)
+    SetNative(L, t, "log", MathLog)
+    SetNative(L, t, "log10", MathLog10)
+    SetNative(L, t, "pow", MathPow)
+    SetNative(L, t, "fmod", MathFmod)
+    SetNative(L, t, "mod", MathFmod)
+    SetNative(L, t, "modf", MathModf)
+    SetNative(L, t, "frexp", MathFrexp)
+    SetNative(L, t, "ldexp", MathLdexp)
+    SetNative(L, t, "deg", MathDeg)
+    SetNative(L, t, "rad", MathRad)
+    SetNative(L, t, "min", MathMin)
+    SetNative(L, t, "max", MathMax)
+    SetNative(L, t, "random", MathRandom)
+    SetNative(L, t, "randomseed", MathRandomSeed)
+    SetValue(L, t, "pi", NumberValue(PI))
+    SetValue(L, t, "huge", NumberValue(Infinity()))
+    L.random_state = 0x2545F4914F6CDD1D
+}

@@ -1,0 +1,1397 @@
+// Scope resolution and register-based code generation from the AST.
+// Locals captured by inner functions live in boxes created at declaration,
+// so each loop iteration's fresh local gets its own box.
+
+#scope_module
+
+OP_MOVE :: 0;
+OP_LOADK :: 1;
+OP_LOADNIL :: 2;
+OP_LOADBOOL :: 3;
+OP_GETUPVAL :: 4;
+OP_SETUPVAL :: 5;
+OP_GETBOX :: 6;
+OP_SETBOX :: 7;
+OP_NEWBOX :: 8;
+OP_GETGLOBAL :: 9;
+OP_SETGLOBAL :: 10;
+OP_GETTABLE :: 11;
+OP_SETTABLE :: 12;
+OP_NEWTABLE :: 13;
+OP_SELF :: 14;
+OP_ADD :: 15;
+OP_SUB :: 16;
+OP_MUL :: 17;
+OP_DIV :: 18;
+OP_MOD :: 19;
+OP_POW :: 20;
+OP_UNM :: 21;
+OP_NOT :: 22;
+OP_LEN :: 23;
+OP_CONCAT :: 24;
+OP_JMP :: 25;
+OP_JT :: 26;
+OP_JF :: 27;
+OP_JEQ :: 28;
+OP_JNE :: 29;
+OP_JLT :: 30;
+OP_JNLT :: 31;
+OP_JLE :: 32;
+OP_JNLE :: 33;
+OP_EQ :: 34;
+OP_NE :: 35;
+OP_LT :: 36;
+OP_LE :: 37;
+OP_CALL :: 38;
+OP_TAILCALL :: 39;
+OP_RETURN :: 40;
+OP_FORPREP :: 41;
+OP_FORLOOP :: 42;
+OP_TFORCALL :: 43;
+OP_TFORLOOP :: 44;
+OP_SETLIST :: 45;
+OP_CLOSURE :: 46;
+OP_VARARG :: 47;
+// Field access with a constant string key: R[A] = R[B][K[C]].
+OP_GETFIELD :: 48;
+// R[A][K[B]] = RK(C).
+OP_SETFIELD :: 49;
+OP_COUNT :: 50;
+
+LFIELDS_PER_FLUSH :: 50;
+
+LocalInfo :: struct {
+    name: s32
+    captured: bool
+    reg: s32
+    locvar: s32
+}
+
+UpvalInfo :: struct {
+    name: s32
+    from_local: bool
+    index: s32
+}
+
+FuncInfo :: struct {
+    parent: s32
+    locals: Vec(LocalInfo)
+    upvals: Vec(UpvalInfo)
+    active: Vec(s32)
+    is_vararg: bool
+}
+
+GotoInfo :: struct {
+    name: s32
+    pc: s32
+    line: s32
+    depth: s32
+}
+
+LabelInfo :: struct {
+    name: s32
+    pc: s32
+    depth: s32
+}
+
+FuncState :: struct {
+    info: s32
+    code: Vec(LuaInstr)
+    lines: Vec(s32)
+    constants: Vec(LuaValue)
+    protos: Vec(s32)
+    upvals: Vec(LuaUpvalDesc)
+    upval_names: Vec(s32)
+    locvars: Vec(LuaLocVar)
+    max_stack: s32
+    freereg: s32
+    nactive: s32
+    line: s32
+    depth: s32
+    breaks: Vec(s32)
+    loop_breaks: Vec(s32)
+    gotos: Vec(GotoInfo)
+    labels: Vec(LabelInfo)
+    active_locals: Vec(s32)
+}
+
+Compiler :: struct {
+    p: *Parser
+    L: *LuaState
+    funcs: Vec(FuncInfo)
+    source: s32
+}
+
+// ---------------------------------------------------------------- resolve
+
+AddFunc :: (c: *Compiler, parent: s32) -> s32 {
+    at := c.funcs.count
+    VecResize(c.funcs, at + 1)
+    c.funcs[at].parent = parent
+    return cast(s32) at
+}
+
+DeclareLocal :: (c: *Compiler, f: s32, decl: s32) {
+    at := c.funcs[f].locals.count
+    VecResize(c.funcs[f].locals, at + 1)
+    c.funcs[f].locals[at].name = c.p.nodes[decl].str
+    c.funcs[f].locals[at].reg = -1
+    c.p.nodes[decl].d = cast(s32) at
+    VecPush(c.funcs[f].active, cast(s32) at)
+}
+
+FindActive :: (c: *Compiler, f: s32, name: s32) -> s32 {
+    i := c.funcs[f].active.count - 1
+    while i >= 0 {
+        local := c.funcs[f].active[i]
+        if c.funcs[f].locals[local].name == name { return local }
+        i -= 1
+    }
+    return -1
+}
+
+// Find or add an upvalue for `name` in function f; -1 when it is a global.
+FindUpval :: (c: *Compiler, f: s32, name: s32) -> s32 {
+    i: s64 = 0
+    while i < c.funcs[f].upvals.count {
+        if c.funcs[f].upvals[i].name == name { return cast(s32) i }
+        i += 1
+    }
+    parent := c.funcs[f].parent
+    if parent < 0 { return -1 }
+    local := FindActive(c, parent, name)
+    from_local := false
+    index: s32 = -1
+    if local >= 0 {
+        c.funcs[parent].locals[local].captured = true
+        from_local = true
+        index = local
+    } else {
+        index = FindUpval(c, parent, name)
+        if index < 0 { return -1 }
+    }
+    at := c.funcs[f].upvals.count
+    VecResize(c.funcs[f].upvals, at + 1)
+    c.funcs[f].upvals[at].name = name
+    c.funcs[f].upvals[at].from_local = from_local
+    c.funcs[f].upvals[at].index = index
+    return cast(s32) at
+}
+
+ResolveList :: (c: *Compiler, f: s32, first: s32) -> bool {
+    e := first
+    while e >= 0 {
+        if !ResolveExpr(c, f, e) { return false }
+        e = c.p.nodes[e].next
+    }
+    return true
+}
+
+ResolveError :: (c: *Compiler, line: s32, message: string) -> bool {
+    c.p.lx.line = line
+    c.p.lx.failed = false
+    LexError(*c.p.lx, message, false)
+    return false
+}
+
+ResolveFunction :: (c: *Compiler, parent: s32, node: s32) -> bool {
+    f := AddFunc(c, parent)
+    c.p.nodes[node].d = f
+    c.funcs[f].is_vararg = c.p.nodes[node].c == 1
+    param := c.p.nodes[node].a
+    while param >= 0 {
+        DeclareLocal(c, f, param)
+        param = c.p.nodes[param].next
+    }
+    return ResolveBlock(c, f, c.p.nodes[node].b)
+}
+
+ResolveExpr :: (c: *Compiler, f: s32, e: s32) -> bool {
+    if e < 0 { return true }
+    kind := c.p.nodes[e].kind
+    if kind == E_NAME {
+        name := c.p.nodes[e].str
+        local := FindActive(c, f, name)
+        if local >= 0 {
+            c.p.nodes[e].c = 1
+            c.p.nodes[e].d = local
+            return true
+        }
+        up := FindUpval(c, f, name)
+        if up >= 0 {
+            c.p.nodes[e].c = 2
+            c.p.nodes[e].d = up
+            return true
+        }
+        c.p.nodes[e].c = 0
+        return true
+    }
+    if kind == E_VARARG {
+        if !c.funcs[f].is_vararg { return ResolveError(c, c.p.nodes[e].line, "cannot use '...' outside a vararg function") }
+        return true
+    }
+    if kind == E_FUNCTION { return ResolveFunction(c, f, e) }
+    if kind == E_TABLE {
+        field := c.p.nodes[e].a
+        while field >= 0 {
+            if !ResolveExpr(c, f, c.p.nodes[field].a) { return false }
+            if !ResolveExpr(c, f, c.p.nodes[field].b) { return false }
+            field = c.p.nodes[field].next
+        }
+        return true
+    }
+    if kind == E_CALL || kind == E_METHOD {
+        if !ResolveExpr(c, f, c.p.nodes[e].a) { return false }
+        return ResolveList(c, f, c.p.nodes[e].b)
+    }
+    if kind == E_BINOP || kind == E_AND || kind == E_OR || kind == E_INDEX {
+        if !ResolveExpr(c, f, c.p.nodes[e].a) { return false }
+        return ResolveExpr(c, f, c.p.nodes[e].b)
+    }
+    if kind == E_UNOP || kind == E_PAREN { return ResolveExpr(c, f, c.p.nodes[e].a) }
+    return true
+}
+
+ResolveBlock :: (c: *Compiler, f: s32, first: s32) -> bool {
+    mark := c.funcs[f].active.count
+    s := first
+    while s >= 0 {
+        if !ResolveStatement(c, f, s) { return false }
+        s = c.p.nodes[s].next
+    }
+    VecResize(c.funcs[f].active, mark)
+    return true
+}
+
+ResolveStatement :: (c: *Compiler, f: s32, s: s32) -> bool {
+    kind := c.p.nodes[s].kind
+    if kind == S_LOCAL {
+        if !ResolveList(c, f, c.p.nodes[s].b) { return false }
+        decl := c.p.nodes[s].a
+        while decl >= 0 { DeclareLocal(c, f, decl); decl = c.p.nodes[decl].next }
+        return true
+    }
+    if kind == S_LOCALFUNC {
+        DeclareLocal(c, f, c.p.nodes[s].a)
+        return ResolveExpr(c, f, c.p.nodes[s].b)
+    }
+    if kind == S_ASSIGN {
+        if !ResolveList(c, f, c.p.nodes[s].a) { return false }
+        return ResolveList(c, f, c.p.nodes[s].b)
+    }
+    if kind == S_CALL { return ResolveExpr(c, f, c.p.nodes[s].a) }
+    if kind == S_DO { return ResolveBlock(c, f, c.p.nodes[s].a) }
+    if kind == S_WHILE {
+        if !ResolveExpr(c, f, c.p.nodes[s].a) { return false }
+        return ResolveBlock(c, f, c.p.nodes[s].b)
+    }
+    if kind == S_REPEAT {
+        // The condition sees the body's locals.
+        mark := c.funcs[f].active.count
+        body := c.p.nodes[s].a
+        while body >= 0 {
+            if !ResolveStatement(c, f, body) { return false }
+            body = c.p.nodes[body].next
+        }
+        ok := ResolveExpr(c, f, c.p.nodes[s].b)
+        VecResize(c.funcs[f].active, mark)
+        return ok
+    }
+    if kind == S_IF {
+        if !ResolveExpr(c, f, c.p.nodes[s].a) { return false }
+        if !ResolveBlock(c, f, c.p.nodes[s].b) { return false }
+        other := c.p.nodes[s].c
+        if other >= 0 {
+            if c.p.nodes[other].kind == S_IF { return ResolveStatement(c, f, other) }
+            return ResolveBlock(c, f, c.p.nodes[other].a)
+        }
+        return true
+    }
+    if kind == S_NUMFOR {
+        if !ResolveExpr(c, f, c.p.nodes[s].b) { return false }
+        if !ResolveExpr(c, f, c.p.nodes[s].c) { return false }
+        if !ResolveExpr(c, f, c.p.nodes[s].d) { return false }
+        mark := c.funcs[f].active.count
+        DeclareLocal(c, f, c.p.nodes[s].a)
+        ok := ResolveBlock(c, f, c.p.nodes[s].e)
+        VecResize(c.funcs[f].active, mark)
+        return ok
+    }
+    if kind == S_GENFOR {
+        if !ResolveList(c, f, c.p.nodes[s].b) { return false }
+        mark := c.funcs[f].active.count
+        decl := c.p.nodes[s].a
+        while decl >= 0 { DeclareLocal(c, f, decl); decl = c.p.nodes[decl].next }
+        ok := ResolveBlock(c, f, c.p.nodes[s].c)
+        VecResize(c.funcs[f].active, mark)
+        return ok
+    }
+    if kind == S_FUNCTION {
+        if !ResolveExpr(c, f, c.p.nodes[s].a) { return false }
+        return ResolveExpr(c, f, c.p.nodes[s].b)
+    }
+    if kind == S_RETURN { return ResolveList(c, f, c.p.nodes[s].a) }
+    return true
+}
+
+// ---------------------------------------------------------------- emit
+
+Emit :: (fs: *FuncState, op: s32, a: s32, b: s32, c: s32) -> s32 {
+    pc := fs.code.count
+    instr: LuaInstr
+    instr.op = cast(u8) op
+    instr.a = a
+    instr.b = b
+    instr.c = c
+    VecPush(fs.code, instr)
+    VecPush(fs.lines, fs.line)
+    return cast(s32) pc
+}
+
+PC :: (fs: *FuncState) -> s32 #inline { return cast(s32) fs.code.count }
+
+Reserve :: (fs: *FuncState, n: s32) -> s32 {
+    r := fs.freereg
+    fs.freereg += n
+    if fs.freereg > fs.max_stack { fs.max_stack = fs.freereg }
+    return r
+}
+
+IsJumpOp :: (op: u8) -> bool { return op >= OP_JMP && op <= OP_JNLE }
+
+// Jump lists are chained through the jump target field (A); -1 ends.
+Concat :: (fs: *FuncState, list: s32, other: s32) -> s32 {
+    if list < 0 { return other }
+    if other < 0 { return list }
+    at := list
+    while fs.code[at].a >= 0 { at = fs.code[at].a }
+    fs.code[at].a = other
+    return list
+}
+
+PatchList :: (fs: *FuncState, list: s32, target: s32) {
+    at := list
+    while at >= 0 {
+        next := fs.code[at].a
+        fs.code[at].a = target
+        at = next
+    }
+}
+
+PatchHere :: (fs: *FuncState, list: s32) { PatchList(fs, list, PC(fs)) }
+
+EmitJump :: (fs: *FuncState) -> s32 { return Emit(fs, OP_JMP, -1, 0, 0) }
+
+AddConstant :: (fs: *FuncState, value: LuaValue) -> s32 {
+    i: s64 = 0
+    count := fs.constants.count
+    // Search recent constants; long tables of literals stay linear-time.
+    if count > 512 { i = count - 512 }
+    while i < count {
+        k := fs.constants[i]
+        if k.t == value.t {
+            if value.t == LUA_TNUMBER {
+                if k.n == value.n && (k.n != 0.0 || IsNegativeZero(k.n) == IsNegativeZero(value.n)) { return cast(s32) i }
+            } else if k.h == value.h {
+                return cast(s32) i
+            }
+        }
+        i += 1
+    }
+    VecPush(fs.constants, value)
+    return cast(s32) count
+}
+
+IsNegativeZero :: (x: float64) -> bool {
+    if x != 0.0 { return false }
+    return 1.0 / x < 0.0
+}
+
+StringK :: (fs: *FuncState, h: s32) -> s32 { return AddConstant(fs, StringValue(h)) }
+NumberK :: (fs: *FuncState, n: float64) -> s32 { return AddConstant(fs, NumberValue(n)) }
+
+// RK operand for constant index k.
+KOperand :: (k: s32) -> s32 #inline { return -1 - k }
+
+LocalOf :: (c: *Compiler, fs: *FuncState, e: s32) -> s32 {
+    return c.p.nodes[e].d
+}
+
+// ---------------------------------------------------------------- expressions
+
+IsMulti :: (c: *Compiler, e: s32) -> bool {
+    kind := c.p.nodes[e].kind
+    return kind == E_CALL || kind == E_METHOD || kind == E_VARARG
+}
+
+// A non-captured local's register, or -1.
+PlainLocalReg :: (c: *Compiler, fs: *FuncState, e: s32) -> s32 {
+    if c.p.nodes[e].kind != E_NAME || c.p.nodes[e].c != 1 { return -1 }
+    local := c.p.nodes[e].d
+    if c.funcs[fs.info].locals[local].captured { return -1 }
+    return c.funcs[fs.info].locals[local].reg
+}
+
+AnyReg :: (c: *Compiler, fs: *FuncState, e: s32) -> s32 {
+    r := PlainLocalReg(c, fs, e)
+    if r >= 0 { return r }
+    r = Reserve(fs, 1)
+    Expr(c, fs, e, r)
+    return r
+}
+
+RK :: (c: *Compiler, fs: *FuncState, e: s32) -> s32 {
+    kind := c.p.nodes[e].kind
+    if kind == E_NUMBER { return KOperand(NumberK(fs, c.p.nodes[e].num)) }
+    if kind == E_STRING { return KOperand(StringK(fs, c.p.nodes[e].str)) }
+    if kind == E_NIL { return KOperand(AddConstant(fs, NilValue())) }
+    if kind == E_TRUE { return KOperand(AddConstant(fs, BoolValue(true))) }
+    if kind == E_FALSE { return KOperand(AddConstant(fs, BoolValue(false))) }
+    return AnyReg(c, fs, e)
+}
+
+// Compile `e` so its single value ends in register dst.
+Expr :: (c: *Compiler, fs: *FuncState, e: s32, dst: s32) {
+    node := c.p.nodes[e]
+    saved_line := fs.line
+    fs.line = node.line
+    saved := fs.freereg
+    kind := node.kind
+    if kind == E_NIL {
+        Emit(fs, OP_LOADNIL, dst, 1, 0)
+    } else if kind == E_TRUE {
+        Emit(fs, OP_LOADBOOL, dst, 1, 0)
+    } else if kind == E_FALSE {
+        Emit(fs, OP_LOADBOOL, dst, 0, 0)
+    } else if kind == E_NUMBER {
+        Emit(fs, OP_LOADK, dst, NumberK(fs, node.num), 0)
+    } else if kind == E_STRING {
+        Emit(fs, OP_LOADK, dst, StringK(fs, node.str), 0)
+    } else if kind == E_VARARG {
+        Emit(fs, OP_VARARG, dst, 2, 0)
+    } else if kind == E_NAME {
+        scope := node.c
+        if scope == 1 {
+            local := node.d
+            reg := c.funcs[fs.info].locals[local].reg
+            if c.funcs[fs.info].locals[local].captured {
+                Emit(fs, OP_GETBOX, dst, reg, 0)
+            } else if reg != dst {
+                Emit(fs, OP_MOVE, dst, reg, 0)
+            }
+        } else if scope == 2 {
+            Emit(fs, OP_GETUPVAL, dst, node.d, 0)
+        } else {
+            Emit(fs, OP_GETGLOBAL, dst, StringK(fs, node.str), 0)
+        }
+    } else if kind == E_INDEX {
+        t := AnyReg(c, fs, node.a)
+        if c.p.nodes[node.b].kind == E_STRING {
+            Emit(fs, OP_GETFIELD, dst, t, StringK(fs, c.p.nodes[node.b].str))
+        } else {
+            k := RK(c, fs, node.b)
+            Emit(fs, OP_GETTABLE, dst, t, k)
+        }
+    } else if kind == E_CALL || kind == E_METHOD {
+        // Reuse dst as the call base when it is the topmost register.
+        if dst == fs.freereg - 1 && dst >= fs.nactive {
+            fs.freereg = dst
+            Call(c, fs, e, 1)
+        } else {
+            base := fs.freereg
+            Call(c, fs, e, 1)
+            Emit(fs, OP_MOVE, dst, base, 0)
+        }
+    } else if kind == E_PAREN {
+        Expr(c, fs, node.a, dst)
+    } else if kind == E_FUNCTION {
+        index := CompileFunction(c, fs, e)
+        Emit(fs, OP_CLOSURE, dst, index, 0)
+    } else if kind == E_TABLE {
+        Table(c, fs, e, dst)
+    } else if kind == E_AND || kind == E_OR {
+        Expr(c, fs, node.a, dst)
+        fs.line = node.line
+        jump := Emit(fs, ifx kind == E_AND then OP_JF else OP_JT, -1, dst, 0)
+        Expr(c, fs, node.b, dst)
+        PatchHere(fs, jump)
+    } else if kind == E_UNOP {
+        r := AnyReg(c, fs, node.a)
+        fs.line = node.line
+        op: s32 = ifx node.op == OPR_MINUS then OP_UNM else (ifx node.op == OPR_NOT then OP_NOT else OP_LEN)
+        Emit(fs, op, dst, r, 0)
+    } else if kind == E_BINOP {
+        op := cast(s32) node.op
+        if op == OPR_CONCAT {
+            ConcatExpr(c, fs, e, dst)
+        } else {
+            left := node.a
+            right := node.b
+            if op == OPR_GT || op == OPR_GE {
+                left = node.b
+                right = node.a
+            }
+            rb := RK(c, fs, left)
+            rc := RK(c, fs, right)
+            fs.line = node.line
+            Emit(fs, ArithOpcode(op), dst, rb, rc)
+        }
+    }
+    fs.freereg = saved
+    fs.line = saved_line
+}
+
+ArithOpcode :: (op: s32) -> s32 {
+    if op == OPR_ADD { return OP_ADD }
+    if op == OPR_SUB { return OP_SUB }
+    if op == OPR_MUL { return OP_MUL }
+    if op == OPR_DIV { return OP_DIV }
+    if op == OPR_MOD { return OP_MOD }
+    if op == OPR_POW { return OP_POW }
+    if op == OPR_EQ { return OP_EQ }
+    if op == OPR_NE { return OP_NE }
+    if op == OPR_LT || op == OPR_GT { return OP_LT }
+    return OP_LE
+}
+
+ConcatExpr :: (c: *Compiler, fs: *FuncState, e: s32, dst: s32) {
+    first := fs.freereg
+    count: s32 = 0
+    at := e
+    while c.p.nodes[at].kind == E_BINOP && c.p.nodes[at].op == OPR_CONCAT {
+        r := Reserve(fs, 1)
+        Expr(c, fs, c.p.nodes[at].a, r)
+        count += 1
+        at = c.p.nodes[at].b
+    }
+    r := Reserve(fs, 1)
+    Expr(c, fs, at, r)
+    fs.line = c.p.nodes[e].line
+    Emit(fs, OP_CONCAT, dst, first, first + count)
+}
+
+// Compile a call with its function at R[freereg]. want: results, -1 for all.
+Call :: (c: *Compiler, fs: *FuncState, e: s32, want: s32) {
+    node := c.p.nodes[e]
+    base := Reserve(fs, 1)
+    if node.kind == E_METHOD {
+        object := AnyReg(c, fs, node.a)
+        Reserve(fs, 1)
+        fs.freereg = base + 2
+        fs.line = node.line
+        Emit(fs, OP_SELF, base, object, KOperand(StringK(fs, node.str)))
+    } else {
+        Expr(c, fs, node.a, base)
+    }
+    nargs := ExprList(c, fs, node.b, -1)
+    fs.line = node.line
+    b: s32 = 0
+    if nargs >= 0 {
+        if node.kind == E_METHOD { nargs += 1 }
+        b = nargs + 1
+    }
+    Emit(fs, OP_CALL, base, b, want + 1)
+    fs.freereg = base + (ifx want > 0 then want else 0)
+    if fs.freereg > fs.max_stack { fs.max_stack = fs.freereg }
+}
+
+// Evaluate a multi-value expression into R[freereg..]: want -1 keeps all.
+ExprMulti :: (c: *Compiler, fs: *FuncState, e: s32, want: s32) {
+    node := c.p.nodes[e]
+    if node.kind == E_VARARG {
+        base := fs.freereg
+        fs.line = node.line
+        Emit(fs, OP_VARARG, base, want + 1, 0)
+        if want > 0 { Reserve(fs, want) }
+        return
+    }
+    Call(c, fs, e, want)
+}
+
+// Evaluate a list into consecutive registers from freereg, adjusted to
+// `want` values (-1: keep everything, ending in a multi-value). Returns the
+// value count, or -1 when the count is only known at run time.
+ExprList :: (c: *Compiler, fs: *FuncState, first: s32, want: s32) -> s32 {
+    base := fs.freereg
+    n: s32 = 0
+    e := first
+    while e >= 0 {
+        last := c.p.nodes[e].next < 0
+        if last && IsMulti(c, e) && (want < 0 || want > n) {
+            if want < 0 {
+                ExprMulti(c, fs, e, -1)
+                return -1
+            }
+            ExprMulti(c, fs, e, want - n)
+            fs.freereg = base + want
+            return want
+        }
+        r := Reserve(fs, 1)
+        Expr(c, fs, e, r)
+        n += 1
+        e = c.p.nodes[e].next
+    }
+    if want >= 0 {
+        if n < want {
+            Emit(fs, OP_LOADNIL, base + n, want - n, 0)
+            Reserve(fs, want - n)
+        }
+        fs.freereg = base + want
+        return want
+    }
+    return n
+}
+
+Table :: (c: *Compiler, fs: *FuncState, e: s32, dst: s32) {
+    t := dst
+    moved := false
+    if dst != fs.freereg - 1 || dst < fs.nactive {
+        t = Reserve(fs, 1)
+        moved = true
+    }
+    narr: s32 = 0
+    nhash: s32 = 0
+    field := c.p.nodes[e].a
+    while field >= 0 {
+        if c.p.nodes[field].kind == F_ITEM { narr += 1 } else { nhash += 1 }
+        field = c.p.nodes[field].next
+    }
+    fs.line = c.p.nodes[e].line
+    Emit(fs, OP_NEWTABLE, t, narr, nhash)
+    pending: s32 = 0
+    stored: s32 = 0
+    field = c.p.nodes[e].a
+    while field >= 0 {
+        node := c.p.nodes[field]
+        if node.kind == F_ITEM {
+            last := node.next < 0
+            if last && IsMulti(c, node.a) {
+                ExprMulti(c, fs, node.a, -1)
+                fs.line = node.line
+                Emit(fs, OP_SETLIST, t, 0, stored)
+                fs.freereg = t + 1
+                pending = 0
+                field = node.next
+                continue
+            }
+            r := Reserve(fs, 1)
+            Expr(c, fs, node.a, r)
+            pending += 1
+            if pending == LFIELDS_PER_FLUSH {
+                fs.line = node.line
+                Emit(fs, OP_SETLIST, t, pending, stored)
+                stored += pending
+                pending = 0
+                fs.freereg = t + 1
+            }
+        } else {
+            saved := fs.freereg
+            value := RK(c, fs, node.b)
+            fs.line = node.line
+            if c.p.nodes[node.a].kind == E_STRING {
+                Emit(fs, OP_SETFIELD, t, StringK(fs, c.p.nodes[node.a].str), value)
+            } else {
+                key := RK(c, fs, node.a)
+                Emit(fs, OP_SETTABLE, t, key, value)
+            }
+            fs.freereg = saved
+        }
+        field = node.next
+    }
+    if pending > 0 {
+        Emit(fs, OP_SETLIST, t, pending, stored)
+    }
+    fs.freereg = t + 1
+    if moved { Emit(fs, OP_MOVE, dst, t, 0) }
+}
+
+// Emit code that jumps when `e` is truthy == jump_when; returns the list.
+CondJump :: (c: *Compiler, fs: *FuncState, e: s32, jump_when: bool) -> s32 {
+    node := c.p.nodes[e]
+    saved := fs.freereg
+    saved_line := fs.line
+    fs.line = node.line
+    result: s32 = -1
+    kind := node.kind
+    if kind == E_AND {
+        if jump_when {
+            skip := CondJump(c, fs, node.a, false)
+            result = CondJump(c, fs, node.b, true)
+            PatchHere(fs, skip)
+        } else {
+            first := CondJump(c, fs, node.a, false)
+            second := CondJump(c, fs, node.b, false)
+            result = Concat(fs, first, second)
+        }
+    } else if kind == E_OR {
+        if jump_when {
+            first := CondJump(c, fs, node.a, true)
+            second := CondJump(c, fs, node.b, true)
+            result = Concat(fs, first, second)
+        } else {
+            skip := CondJump(c, fs, node.a, true)
+            result = CondJump(c, fs, node.b, false)
+            PatchHere(fs, skip)
+        }
+    } else if kind == E_UNOP && node.op == OPR_NOT {
+        result = CondJump(c, fs, node.a, !jump_when)
+    } else if kind == E_PAREN {
+        result = CondJump(c, fs, node.a, jump_when)
+    } else if kind == E_NIL || kind == E_FALSE {
+        if !jump_when { result = EmitJump(fs) }
+    } else if kind == E_TRUE || kind == E_NUMBER || kind == E_STRING || kind == E_FUNCTION || kind == E_TABLE {
+        if kind == E_FUNCTION || kind == E_TABLE {
+            // Still evaluate for side effects of nested expressions.
+            r := Reserve(fs, 1)
+            Expr(c, fs, e, r)
+        }
+        if jump_when { result = EmitJump(fs) }
+    } else if kind == E_BINOP && node.op >= OPR_NE && node.op <= OPR_GE {
+        op := cast(s32) node.op
+        left := node.a
+        right := node.b
+        if op == OPR_GT || op == OPR_GE {
+            left = node.b
+            right = node.a
+        }
+        rb := RK(c, fs, left)
+        rc := RK(c, fs, right)
+        fs.line = node.line
+        opcode: s32
+        if op == OPR_EQ { opcode = ifx jump_when then OP_JEQ else OP_JNE }
+        else if op == OPR_NE { opcode = ifx jump_when then OP_JNE else OP_JEQ }
+        else if op == OPR_LT || op == OPR_GT { opcode = ifx jump_when then OP_JLT else OP_JNLT }
+        else { opcode = ifx jump_when then OP_JLE else OP_JNLE }
+        result = Emit(fs, opcode, -1, rb, rc)
+    } else {
+        r := AnyReg(c, fs, e)
+        fs.line = node.line
+        result = Emit(fs, ifx jump_when then OP_JT else OP_JF, -1, r, 0)
+    }
+    fs.freereg = saved
+    fs.line = saved_line
+    return result
+}
+
+// ---------------------------------------------------------------- statements
+
+ActivateLocal :: (c: *Compiler, fs: *FuncState, decl: s32, reg: s32) {
+    local := c.p.nodes[decl].d
+    c.funcs[fs.info].locals[local].reg = reg
+    lv: LuaLocVar
+    lv.name = c.p.nodes[decl].str
+    lv.reg = reg
+    lv.start_pc = PC(fs)
+    lv.end_pc = -1
+    c.funcs[fs.info].locals[local].locvar = cast(s32) fs.locvars.count
+    VecPush(fs.locvars, lv)
+    VecPush(fs.active_locals, local)
+    if c.funcs[fs.info].locals[local].captured {
+        Emit(fs, OP_NEWBOX, reg, 0, 0)
+    }
+}
+
+EnterBlock :: (fs: *FuncState) -> s32 {
+    fs.depth += 1
+    return cast(s32) fs.active_locals.count
+}
+
+LeaveBlock :: (c: *Compiler, fs: *FuncState, mark: s32, reg_mark: s32) {
+    i := fs.active_locals.count - 1
+    while i >= mark {
+        local := fs.active_locals[i]
+        lv := c.funcs[fs.info].locals[local].locvar
+        fs.locvars[lv].end_pc = PC(fs)
+        i -= 1
+    }
+    VecResize(fs.active_locals, cast(s64) mark)
+    // Labels of this block go out of scope; pending gotos move outward.
+    j: s64 = fs.labels.count - 1
+    while j >= 0 && fs.labels[j].depth >= fs.depth {
+        j -= 1
+    }
+    VecResize(fs.labels, j + 1)
+    g: s64 = 0
+    while g < fs.gotos.count {
+        if fs.gotos[g].depth >= fs.depth { fs.gotos[g].depth = fs.depth - 1 }
+        g += 1
+    }
+    fs.depth -= 1
+    fs.nactive = reg_mark
+    fs.freereg = reg_mark
+}
+
+Block :: (c: *Compiler, fs: *FuncState, first: s32) -> bool {
+    mark := EnterBlock(fs)
+    reg_mark := fs.nactive
+    ok := Statements(c, fs, first)
+    LeaveBlock(c, fs, mark, reg_mark)
+    return ok
+}
+
+Statements :: (c: *Compiler, fs: *FuncState, first: s32) -> bool {
+    s := first
+    while s >= 0 {
+        if !Statement(c, fs, s) { return false }
+        fs.freereg = fs.nactive
+        s = c.p.nodes[s].next
+    }
+    return true
+}
+
+CompileError :: (c: *Compiler, line: s32, message: string) -> bool {
+    return ResolveError(c, line, message)
+}
+
+StoreTo :: (c: *Compiler, fs: *FuncState, target: s32, value: s32) {
+    // value: an RK operand.
+    node := c.p.nodes[target]
+    fs.line = node.line
+    if node.kind == E_NAME {
+        if node.c == 1 {
+            local := node.d
+            reg := c.funcs[fs.info].locals[local].reg
+            if c.funcs[fs.info].locals[local].captured {
+                Emit(fs, OP_SETBOX, reg, value, 0)
+            } else {
+                if value < 0 { Emit(fs, OP_LOADK, reg, -1 - value, 0) } else if value != reg { Emit(fs, OP_MOVE, reg, value, 0) }
+            }
+            return
+        }
+        r := value
+        if r < 0 {
+            r = Reserve(fs, 1)
+            Emit(fs, OP_LOADK, r, -1 - value, 0)
+        }
+        if node.c == 2 {
+            Emit(fs, OP_SETUPVAL, r, node.d, 0)
+        } else {
+            Emit(fs, OP_SETGLOBAL, r, StringK(fs, node.str), 0)
+        }
+    }
+}
+
+SafeDirect :: (c: *Compiler, e: s32) -> bool {
+    kind := c.p.nodes[e].kind
+    return kind != E_TABLE && kind != E_AND && kind != E_OR && kind != E_CALL && kind != E_METHOD
+}
+
+Assign :: (c: *Compiler, fs: *FuncState, s: s32) -> bool {
+    first := c.p.nodes[s].a
+    exprs := c.p.nodes[s].b
+    if c.p.nodes[first].next < 0 && exprs >= 0 && c.p.nodes[exprs].next < 0 {
+        // Single assignment.
+        target := c.p.nodes[first]
+        if target.kind == E_INDEX {
+            t := AnyReg(c, fs, target.a)
+            if c.p.nodes[target.b].kind == E_STRING {
+                k := StringK(fs, c.p.nodes[target.b].str)
+                v := RK(c, fs, exprs)
+                fs.line = target.line
+                Emit(fs, OP_SETFIELD, t, k, v)
+            } else {
+                k := RK(c, fs, target.b)
+                v := RK(c, fs, exprs)
+                fs.line = target.line
+                Emit(fs, OP_SETTABLE, t, k, v)
+            }
+            return true
+        }
+        reg := PlainLocalReg(c, fs, first)
+        if reg >= 0 {
+            if SafeDirect(c, exprs) {
+                Expr(c, fs, exprs, reg)
+            } else {
+                r := Reserve(fs, 1)
+                Expr(c, fs, exprs, r)
+                Emit(fs, OP_MOVE, reg, r, 0)
+            }
+            return true
+        }
+        v := RK(c, fs, exprs)
+        StoreTo(c, fs, first, v)
+        return true
+    }
+    // Multiple assignment: evaluate target prefixes, then values, then store.
+    count: s32 = 0
+    target := first
+    while target >= 0 {
+        node := c.p.nodes[target]
+        if node.kind == E_INDEX {
+            t := Reserve(fs, 1)
+            Expr(c, fs, node.a, t)
+            k := Reserve(fs, 1)
+            Expr(c, fs, node.b, k)
+            c.p.nodes[target].e = t
+        }
+        count += 1
+        target = node.next
+    }
+    base := fs.freereg
+    ExprList(c, fs, exprs, count)
+    i := count - 1
+    while i >= 0 {
+        // Walk to the i-th target.
+        at := first
+        j: s32 = 0
+        while j < i { at = c.p.nodes[at].next; j += 1 }
+        node := c.p.nodes[at]
+        if node.kind == E_INDEX {
+            fs.line = node.line
+            Emit(fs, OP_SETTABLE, node.e, node.e + 1, base + i)
+        } else {
+            StoreTo(c, fs, at, base + i)
+        }
+        i -= 1
+    }
+    return true
+}
+
+LocalStatement :: (c: *Compiler, fs: *FuncState, s: s32) -> bool {
+    count: s32 = 0
+    decl := c.p.nodes[s].a
+    while decl >= 0 { count += 1; decl = c.p.nodes[decl].next }
+    base := fs.freereg
+    exprs := c.p.nodes[s].b
+    if exprs < 0 {
+        fs.line = c.p.nodes[s].line
+        Emit(fs, OP_LOADNIL, base, count, 0)
+        Reserve(fs, count)
+    } else if count == 1 && c.p.nodes[exprs].next < 0 && !IsMulti(c, exprs) {
+        r := Reserve(fs, 1)
+        Expr(c, fs, exprs, r)
+    } else {
+        ExprList(c, fs, exprs, count)
+    }
+    decl = c.p.nodes[s].a
+    i: s32 = 0
+    while decl >= 0 {
+        ActivateLocal(c, fs, decl, base + i)
+        i += 1
+        decl = c.p.nodes[decl].next
+    }
+    fs.nactive = base + count
+    fs.freereg = fs.nactive
+    return true
+}
+
+LocalFunction :: (c: *Compiler, fs: *FuncState, s: s32) -> bool {
+    decl := c.p.nodes[s].a
+    reg := Reserve(fs, 1)
+    local := c.p.nodes[decl].d
+    captured := c.funcs[fs.info].locals[local].captured
+    fs.line = c.p.nodes[s].line
+    if captured { Emit(fs, OP_LOADNIL, reg, 1, 0) }
+    ActivateLocal(c, fs, decl, reg)
+    fs.nactive = reg + 1
+    index := CompileFunction(c, fs, c.p.nodes[s].b)
+    if captured {
+        t := Reserve(fs, 1)
+        Emit(fs, OP_CLOSURE, t, index, 0)
+        Emit(fs, OP_SETBOX, reg, t, 0)
+    } else {
+        Emit(fs, OP_CLOSURE, reg, index, 0)
+    }
+    return true
+}
+
+FunctionStatement :: (c: *Compiler, fs: *FuncState, s: s32) -> bool {
+    target := c.p.nodes[s].a
+    function := c.p.nodes[s].b
+    node := c.p.nodes[target]
+    if node.kind == E_INDEX {
+        t := AnyReg(c, fs, node.a)
+        r := Reserve(fs, 1)
+        Expr(c, fs, function, r)
+        fs.line = c.p.nodes[s].line
+        Emit(fs, OP_SETFIELD, t, StringK(fs, c.p.nodes[node.b].str), r)
+        return true
+    }
+    reg := PlainLocalReg(c, fs, target)
+    if reg >= 0 {
+        Expr(c, fs, function, reg)
+        return true
+    }
+    r := Reserve(fs, 1)
+    Expr(c, fs, function, r)
+    StoreTo(c, fs, target, r)
+    return true
+}
+
+Return :: (c: *Compiler, fs: *FuncState, s: s32) -> bool {
+    first := c.p.nodes[s].a
+    fs.line = c.p.nodes[s].line
+    if first < 0 {
+        Emit(fs, OP_RETURN, 0, 1, 0)
+        return true
+    }
+    if c.p.nodes[first].next < 0 {
+        kind := c.p.nodes[first].kind
+        if kind == E_CALL || kind == E_METHOD {
+            base := fs.freereg
+            Call(c, fs, first, -1)
+            last := fs.code.count - 1
+            fs.code[last].op = OP_TAILCALL
+            Emit(fs, OP_RETURN, base, 0, 0)
+            return true
+        }
+        if kind != E_VARARG {
+            r := AnyReg(c, fs, first)
+            fs.line = c.p.nodes[s].line
+            Emit(fs, OP_RETURN, r, 2, 0)
+            return true
+        }
+    }
+    base := fs.freereg
+    n := ExprList(c, fs, first, -1)
+    fs.line = c.p.nodes[s].line
+    Emit(fs, OP_RETURN, base, n + 1, 0)
+    return true
+}
+
+LoopStart :: (fs: *FuncState) -> s64 { return fs.breaks.count }
+
+LoopEnd :: (fs: *FuncState, mark: s64) {
+    i := mark
+    while i < fs.breaks.count {
+        fs.code[fs.breaks[i]].a = PC(fs)
+        i += 1
+    }
+    VecResize(fs.breaks, mark)
+    VecResize(fs.loop_breaks, fs.loop_breaks.count - 1)
+}
+
+Statement :: (c: *Compiler, fs: *FuncState, s: s32) -> bool {
+    node := c.p.nodes[s]
+    fs.line = node.line
+    kind := node.kind
+    if kind == S_LOCAL { return LocalStatement(c, fs, s) }
+    if kind == S_LOCALFUNC { return LocalFunction(c, fs, s) }
+    if kind == S_ASSIGN { return Assign(c, fs, s) }
+    if kind == S_FUNCTION { return FunctionStatement(c, fs, s) }
+    if kind == S_CALL {
+        Call(c, fs, node.a, 0)
+        return true
+    }
+    if kind == S_DO { return Block(c, fs, node.a) }
+    if kind == S_RETURN { return Return(c, fs, s) }
+    if kind == S_BREAK {
+        if fs.loop_breaks.count == 0 { return CompileError(c, node.line, "no loop to break") }
+        jump := EmitJump(fs)
+        VecPush(fs.breaks, jump)
+        return true
+    }
+    if kind == S_GOTO {
+        // Backward jump to a visible label?
+        i := fs.labels.count - 1
+        while i >= 0 {
+            if fs.labels[i].name == node.str {
+                Emit(fs, OP_JMP, fs.labels[i].pc, 1, 0)
+                return true
+            }
+            i -= 1
+        }
+        g: GotoInfo
+        g.name = node.str
+        g.pc = EmitJump(fs)
+        g.line = node.line
+        g.depth = fs.depth
+        VecPush(fs.gotos, g)
+        return true
+    }
+    if kind == S_LABEL {
+        i: s64 = 0
+        while i < fs.labels.count {
+            if fs.labels[i].name == node.str && fs.labels[i].depth == fs.depth {
+                return CompileError(c, node.line, "label already defined")
+            }
+            i += 1
+        }
+        label: LabelInfo
+        label.name = node.str
+        label.pc = PC(fs)
+        label.depth = fs.depth
+        VecPush(fs.labels, label)
+        // Resolve pending forward gotos from this block or nested blocks.
+        g: s64 = 0
+        while g < fs.gotos.count {
+            if fs.gotos[g].name == node.str && fs.gotos[g].depth >= fs.depth {
+                fs.code[fs.gotos[g].pc].a = label.pc
+                fs.gotos[g] = fs.gotos[fs.gotos.count - 1]
+                VecResize(fs.gotos, fs.gotos.count - 1)
+                continue
+            }
+            g += 1
+        }
+        return true
+    }
+    if kind == S_WHILE {
+        start := PC(fs)
+        exit := CondJump(c, fs, node.a, false)
+        mark := LoopStart(fs)
+        VecPush(fs.loop_breaks, 1)
+        if !Block(c, fs, node.b) { return false }
+        fs.line = node.line
+        Emit(fs, OP_JMP, start, 1, 0)
+        PatchHere(fs, exit)
+        LoopEnd(fs, mark)
+        return true
+    }
+    if kind == S_REPEAT {
+        start := PC(fs)
+        mark := LoopStart(fs)
+        VecPush(fs.loop_breaks, 1)
+        block_mark := EnterBlock(fs)
+        reg_mark := fs.nactive
+        if !Statements(c, fs, node.a) { return false }
+        back := CondJump(c, fs, node.b, false)
+        PatchList(fs, back, start)
+        // Mark the backward jumps for hook checks.
+        LeaveBlock(c, fs, block_mark, reg_mark)
+        LoopEnd(fs, mark)
+        return true
+    }
+    if kind == S_IF {
+        exits: s32 = -1
+        current := s
+        while true {
+            branch := c.p.nodes[current]
+            fs.line = branch.line
+            skip := CondJump(c, fs, branch.a, false)
+            if !Block(c, fs, branch.b) { return false }
+            other := branch.c
+            if other < 0 {
+                PatchHere(fs, skip)
+                break
+            }
+            exits = Concat(fs, exits, EmitJump(fs))
+            PatchHere(fs, skip)
+            if c.p.nodes[other].kind == S_IF {
+                current = other
+                continue
+            }
+            if !Block(c, fs, c.p.nodes[other].a) { return false }
+            break
+        }
+        PatchHere(fs, exits)
+        return true
+    }
+    if kind == S_NUMFOR {
+        base := fs.freereg
+        Reserve(fs, 3)
+        Expr(c, fs, node.b, base)
+        Expr(c, fs, node.c, base + 1)
+        if node.d >= 0 {
+            Expr(c, fs, node.d, base + 2)
+        } else {
+            Emit(fs, OP_LOADK, base + 2, NumberK(fs, 1.0), 0)
+        }
+        fs.nactive = base + 3
+        fs.freereg = base + 3
+        fs.line = node.line
+        prep := Emit(fs, OP_FORPREP, base, -1, 0)
+        mark := LoopStart(fs)
+        VecPush(fs.loop_breaks, 1)
+        block_mark := EnterBlock(fs)
+        reg_mark := fs.nactive
+        body := PC(fs)
+        Reserve(fs, 1)
+        ActivateLocal(c, fs, node.a, base + 3)
+        fs.nactive = base + 4
+        if !Statements(c, fs, node.e) { return false }
+        LeaveBlock(c, fs, block_mark, reg_mark)
+        fs.line = node.line
+        loop := Emit(fs, OP_FORLOOP, base, body, 0)
+        fs.code[prep].b = loop
+        LoopEnd(fs, mark)
+        fs.nactive = base
+        fs.freereg = base
+        return true
+    }
+    if kind == S_GENFOR {
+        base := fs.freereg
+        ExprList(c, fs, node.b, 3)
+        fs.nactive = base + 3
+        fs.freereg = base + 3
+        nvars: s32 = 0
+        decl := node.a
+        while decl >= 0 { nvars += 1; decl = c.p.nodes[decl].next }
+        fs.line = node.line
+        jump := EmitJump(fs)
+        mark := LoopStart(fs)
+        VecPush(fs.loop_breaks, 1)
+        block_mark := EnterBlock(fs)
+        reg_mark := fs.nactive
+        body := PC(fs)
+        Reserve(fs, nvars)
+        decl = node.a
+        i: s32 = 0
+        while decl >= 0 {
+            ActivateLocal(c, fs, decl, base + 3 + i)
+            i += 1
+            decl = c.p.nodes[decl].next
+        }
+        fs.nactive = base + 3 + nvars
+        if !Statements(c, fs, node.c) { return false }
+        LeaveBlock(c, fs, block_mark, reg_mark)
+        fs.line = node.line
+        PatchHere(fs, jump)
+        Emit(fs, OP_TFORCALL, base, 0, nvars)
+        if base + 3 + nvars > fs.max_stack { fs.max_stack = base + 3 + nvars }
+        // The generic call copies f, s, ctl to base+3..base+5; next() writes two.
+        if base + 6 > fs.max_stack { fs.max_stack = base + 6 }
+        Emit(fs, OP_TFORLOOP, base, body, 0)
+        LoopEnd(fs, mark)
+        fs.nactive = base
+        fs.freereg = base
+        return true
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- functions
+
+ChunkSource :: (c: *Compiler) -> s32 { return c.source }
+
+// Compile a function node into a new prototype; returns its index in the
+// enclosing prototype's list.
+CompileFunction :: (c: *Compiler, parent: *FuncState, e: s32) -> s32 {
+    proto := BuildProto(c, e, parent)
+    index := cast(s32) parent.protos.count
+    VecPush(parent.protos, proto)
+    return index
+}
+
+BuildProto :: (c: *Compiler, e: s32, parent: *FuncState) -> s32 {
+    node := c.p.nodes[e]
+    fs: FuncState
+    fs.info = node.d
+    fs.line = node.line
+    fs.depth = 0
+    // Parameters occupy the first registers.
+    nparams: s32 = 0
+    param := node.a
+    while param >= 0 {
+        Reserve(*fs, 1)
+        ActivateLocal(c, *fs, param, nparams)
+        nparams += 1
+        param = c.p.nodes[param].next
+    }
+    fs.nactive = nparams
+    fs.freereg = nparams
+    if fs.max_stack < 2 { fs.max_stack = 2 }
+    ok := Statements(c, *fs, node.b)
+    fs.line = node.e
+    Emit(*fs, OP_RETURN, 0, 1, 0)
+    if ok && fs.gotos.count > 0 {
+        message: Vec(u8)
+        BuilderAppend(message, "no visible label '")
+        BuilderAppend(message, StrView(c.L, fs.gotos[0].name))
+        BuilderAppend(message, "' for goto")
+        CompileError(c, fs.gotos[0].line, BytesView(*message))
+        VecFree(message)
+    }
+    // Upvalue descriptors refer to parent registers or parent upvalues.
+    info := fs.info
+    i: s64 = 0
+    while i < c.funcs[info].upvals.count {
+        desc: LuaUpvalDesc
+        desc.from_local = c.funcs[info].upvals[i].from_local
+        if desc.from_local {
+            parent_info := c.funcs[info].parent
+            desc.index = c.funcs[parent_info].locals[c.funcs[info].upvals[i].index].reg
+        } else {
+            desc.index = c.funcs[info].upvals[i].index
+        }
+        VecPush(fs.upvals, desc)
+        VecPush(fs.upval_names, c.funcs[info].upvals[i].name)
+        i += 1
+    }
+    h := NewProtoObject(c.L)
+    VecSwap(c.L.protos[h].code, fs.code)
+    VecSwap(c.L.protos[h].lines, fs.lines)
+    VecSwap(c.L.protos[h].constants, fs.constants)
+    VecSwap(c.L.protos[h].protos, fs.protos)
+    VecSwap(c.L.protos[h].upvals, fs.upvals)
+    VecSwap(c.L.protos[h].upval_names, fs.upval_names)
+    VecSwap(c.L.protos[h].locvars, fs.locvars)
+    c.L.protos[h].num_params = nparams
+    c.L.protos[h].is_vararg = node.c == 1
+    c.L.protos[h].max_stack = fs.max_stack + 1
+    c.L.protos[h].line_defined = node.line
+    c.L.protos[h].last_line = node.e
+    c.L.protos[h].source = c.source
+    c.L.allocated += c.L.protos[h].code.count * 20 + c.L.protos[h].constants.count * 16
+    FreeFuncState(*fs)
+    return h
+}
+
+FreeFuncState :: (fs: *FuncState) {
+    VecFree(fs.code)
+    VecFree(fs.lines)
+    VecFree(fs.constants)
+    VecFree(fs.protos)
+    VecFree(fs.upvals)
+    VecFree(fs.upval_names)
+    VecFree(fs.locvars)
+    VecFree(fs.breaks)
+    VecFree(fs.loop_breaks)
+    VecFree(fs.gotos)
+    VecFree(fs.labels)
+    VecFree(fs.active_locals)
+}
+
+// Parse and compile a chunk. Returns the main prototype or -1 with the
+// message in `error`. No garbage collection runs while compiling.
+CompileChunk :: (L: *LuaState, text: string, chunkname: string, error: *Vec(u8)) -> s32 {
+    parser: Parser
+    p := *parser
+    p.lx.L = L
+    p.lx.src = text
+    p.lx.line = 1
+    p.lx.chunk = chunkname
+    // Skip a shebang line.
+    if text.count > 0 && text[0] == #char "#" {
+        while p.lx.pos < text.count && text[p.lx.pos] != 10 { p.lx.pos += 1 }
+    }
+    NextToken(*p.lx)
+    main := AddNode(p, E_FUNCTION, 0)
+    p.nodes[main].c = 1
+    body := ParseBlock(p)
+    p.nodes[main].b = body
+    p.nodes[main].e = p.lx.line
+    if !p.lx.failed && p.lx.tok.kind != TK_EOS {
+        SyntaxError(p, "'<eof>' expected")
+    }
+    result: s32 = -1
+    if !p.lx.failed {
+        compiler: Compiler
+        c := *compiler
+        c.p = p
+        c.L = L
+        c.source = Intern(L, chunkname)
+        if ResolveFunction(c, -1, main) {
+            dummy: FuncState
+            result = BuildProto(c, main, *dummy)
+            FreeFuncState(*dummy)
+        }
+        if p.lx.failed { result = -1 }
+        i: s64 = 0
+        while i < c.funcs.count {
+            VecFree(c.funcs[i].locals)
+            VecFree(c.funcs[i].upvals)
+            VecFree(c.funcs[i].active)
+            i += 1
+        }
+        VecFree(c.funcs)
+    }
+    if p.lx.failed {
+        VecClear(<<error)
+        BuilderAppend(<<error, BytesView(*p.lx.message))
+        result = -1
+    }
+    VecFree(p.nodes)
+    VecFree(p.lx.message)
+    VecFree(p.lx.buf)
+    return result
+}

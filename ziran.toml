@@ -1,0 +1,10 @@
+[package]
+name = "lua"
+module_roots = ["src", "tests"]
+
+[toolchain]
+git = "https://github.com/ziranlang/ziran.git"
+ref = "master"
+
+[exports]
+vm = "src/vm.zi"

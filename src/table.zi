@@ -1,0 +1,300 @@
+// Lua tables: a dense array part for keys 1..n plus an open-addressed hash
+// part with linear probing. Assigning nil keeps the key as a dead entry so
+// `next` keeps working during traversal; a rehash drops dead keys.
+
+#scope_module
+
+NumberBits :: union { f: float64; u: u64; }
+
+MixHash :: (x: u64) -> u64 #inline {
+    h := x * 0x9E3779B97F4A7C15
+    return h ^ (h >> 29)
+}
+
+// Integral value of n when it is a whole number in s64 range.
+AsInteger :: (n: float64) -> (value: s64, ok: bool) #inline {
+    if n >= -9007199254740992.0 && n <= 9007199254740992.0 {
+        i := cast(s64) n
+        if cast(float64) i == n { return i, true }
+    }
+    return 0, false
+}
+
+KeyHash :: (key: LuaValue) -> u64 #inline {
+    if key.t == LUA_TSTRING { return MixHash(cast(u64) key.h + 0x51) }
+    if key.t == LUA_TNUMBER || key.t == LUA_TLIGHTUSERDATA {
+        i, ok := AsInteger(key.n)
+        if ok { return MixHash(cast(u64) i) }
+        bits: NumberBits
+        bits.f = key.n
+        return MixHash(bits.u)
+    }
+    return MixHash((cast(u64) key.t << 32) ^ cast(u64) key.h)
+}
+
+// Slot holding `key`, or -1.
+FindSlot :: (L: *LuaState, t: s32, key: LuaValue) -> s64 {
+    count := L.tables[t].nodes.count
+    if count == 0 { return -1 }
+    mask := count - 1
+    slot := cast(s64)(KeyHash(key) & cast(u64) mask)
+    while true {
+        k := L.tables[t].nodes[slot].key
+        if k.t == LUA_TNIL { return -1 }
+        if RawEqual(k, key) { return slot }
+        slot = (slot + 1) & mask
+    }
+    return -1
+}
+
+// Fast string-key lookup (strings are interned, so handles compare).
+FindStringSlot :: (L: *LuaState, t: s32, h: s32) -> s64 #inline {
+    count := L.tables[t].nodes.count
+    if count == 0 { return -1 }
+    mask := count - 1
+    slot := cast(s64)(MixHash(cast(u64) h + 0x51) & cast(u64) mask)
+    while true {
+        k := *L.tables[t].nodes[slot].key
+        if k.t == LUA_TSTRING && k.h == h { return slot }
+        if k.t == LUA_TNIL { return -1 }
+        slot = (slot + 1) & mask
+    }
+    return -1
+}
+
+GetStr :: (L: *LuaState, t: s32, h: s32) -> LuaValue #inline {
+    slot := FindStringSlot(L, t, h)
+    if slot < 0 { return NilValue() }
+    return L.tables[t].nodes[slot].value
+}
+
+GetInt :: (L: *LuaState, t: s32, i: s64) -> LuaValue #inline {
+    if i >= 1 && i <= L.tables[t].arr.count { return L.tables[t].arr[i - 1] }
+    if L.tables[t].nodes.count == 0 { return NilValue() }
+    slot := FindSlot(L, t, NumberValue(cast(float64) i))
+    if slot < 0 { return NilValue() }
+    return L.tables[t].nodes[slot].value
+}
+
+RawGet :: (L: *LuaState, t: s32, key: LuaValue) -> LuaValue {
+    if key.t == LUA_TSTRING { return GetStr(L, t, key.h) }
+    if key.t == LUA_TNUMBER {
+        i, ok := AsInteger(key.n)
+        if ok && i >= 1 && i <= L.tables[t].arr.count { return L.tables[t].arr[i - 1] }
+    }
+    if key.t == LUA_TNIL { return NilValue() }
+    slot := FindSlot(L, t, key)
+    if slot < 0 { return NilValue() }
+    return L.tables[t].nodes[slot].value
+}
+
+// Insert a key known to be absent into a table with room.
+InsertNew :: (L: *LuaState, t: s32, key: LuaValue, value: LuaValue) {
+    mask := L.tables[t].nodes.count - 1
+    slot := cast(s64)(KeyHash(key) & cast(u64) mask)
+    while L.tables[t].nodes[slot].key.t != LUA_TNIL { slot = (slot + 1) & mask }
+    L.tables[t].nodes[slot].key = key
+    L.tables[t].nodes[slot].value = value
+    L.tables[t].used += 1
+}
+
+// Rebuild the hash part with room for `extra` more keys, dropping dead keys.
+Rehash :: (L: *LuaState, t: s32, extra: s64) {
+    live: s64 = 0
+    i: s64 = 0
+    while i < L.tables[t].nodes.count {
+        if L.tables[t].nodes[i].key.t != LUA_TNIL && L.tables[t].nodes[i].value.t != LUA_TNIL { live += 1 }
+        i += 1
+    }
+    needed := live + extra
+    size: s64 = 4
+    while size * 3 < needed * 4 { size *= 2 }
+    old: Vec(LuaNode)
+    VecSwap(old, L.tables[t].nodes)
+    VecResize(L.tables[t].nodes, size)
+    L.tables[t].used = 0
+    L.allocated += (size - old.count) * 32
+    i = 0
+    while i < old.count {
+        if old[i].key.t != LUA_TNIL && old[i].value.t != LUA_TNIL {
+            InsertNew(L, t, old[i].key, old[i].value)
+        }
+        i += 1
+    }
+    VecFree(old)
+}
+
+// Move keys n+1, n+2, ... from the hash part onto the end of the array.
+MigrateToArray :: (L: *LuaState, t: s32) {
+    while L.tables[t].nodes.count > 0 {
+        next := cast(float64)(L.tables[t].arr.count + 1)
+        slot := FindSlot(L, t, NumberValue(next))
+        if slot < 0 || L.tables[t].nodes[slot].value.t == LUA_TNIL { return }
+        value := L.tables[t].nodes[slot].value
+        // Leave a dead key behind so probing chains stay intact.
+        L.tables[t].nodes[slot].value = NilValue()
+        VecPush(L.tables[t].arr, value)
+        L.allocated += 16
+    }
+}
+
+// Assign t[key] = value without metamethods. The key must not be nil/NaN.
+RawSet :: (L: *LuaState, t: s32, key: LuaValue, value: LuaValue) {
+    L.tables[t].absent = 0
+    if key.t == LUA_TNUMBER {
+        i, ok := AsInteger(key.n)
+        if ok {
+            SetInt(L, t, i, value)
+            return
+        }
+    }
+    SetHash(L, t, key, value)
+}
+
+SetHash :: (L: *LuaState, t: s32, key: LuaValue, value: LuaValue) {
+    slot: s64
+    if key.t == LUA_TSTRING { slot = FindStringSlot(L, t, key.h) } else { slot = FindSlot(L, t, key) }
+    if slot >= 0 {
+        L.tables[t].nodes[slot].value = value
+        return
+    }
+    if value.t == LUA_TNIL { return }
+    if (L.tables[t].used + 1) * 4 > L.tables[t].nodes.count * 3 { Rehash(L, t, 1) }
+    InsertNew(L, t, key, value)
+}
+
+SetInt :: (L: *LuaState, t: s32, i: s64, value: LuaValue) {
+    L.tables[t].absent = 0
+    count := L.tables[t].arr.count
+    if i >= 1 && i <= count {
+        L.tables[t].arr[i - 1] = value
+        return
+    }
+    key := NumberValue(cast(float64) i)
+    if i == count + 1 && value.t != LUA_TNIL {
+        slot: s64 = -1
+        if L.tables[t].nodes.count > 0 { slot = FindSlot(L, t, key) }
+        if slot < 0 {
+            VecPush(L.tables[t].arr, value)
+            L.allocated += 16
+            if L.tables[t].nodes.count > 0 { MigrateToArray(L, t) }
+            return
+        }
+        L.tables[t].nodes[slot].value = value
+        return
+    }
+    SetHash(L, t, key, value)
+}
+
+SetStr :: (L: *LuaState, t: s32, h: s32, value: LuaValue) {
+    L.tables[t].absent = 0
+    SetHash(L, t, StringValue(h), value)
+}
+
+// A border of the table (Lua's # operator).
+TableLength :: (L: *LuaState, t: s32) -> s64 {
+    n := L.tables[t].arr.count
+    if n > 0 && L.tables[t].arr[n - 1].t == LUA_TNIL {
+        // Binary search for a border inside the array.
+        low: s64 = 0
+        high := n
+        while high - low > 1 {
+            middle := (low + high) / 2
+            if L.tables[t].arr[middle - 1].t == LUA_TNIL { high = middle } else { low = middle }
+        }
+        return low
+    }
+    if L.tables[t].nodes.count == 0 { return n }
+    // Unbound search in the hash part.
+    i := n
+    j := n + 1
+    while GetInt(L, t, j).t != LUA_TNIL {
+        i = j
+        if j > 4611686018427387903 / 2 {
+            // Pathological: linear scan.
+            k: s64 = 1
+            while GetInt(L, t, k).t != LUA_TNIL { k += 1 }
+            return k - 1
+        }
+        j *= 2
+    }
+    while j - i > 1 {
+        middle := (i + j) / 2
+        if GetInt(L, t, middle).t == LUA_TNIL { j = middle } else { i = middle }
+    }
+    return i
+}
+
+// Iteration: position 0..arr.count-1 is the array, then hash slots.
+// Returns the next position with a non-nil value at or after `from`, or -1.
+NextPosition :: (L: *LuaState, t: s32, from: s64) -> s64 {
+    i := from
+    n := L.tables[t].arr.count
+    while i < n {
+        if L.tables[t].arr[i].t != LUA_TNIL { return i }
+        i += 1
+    }
+    count := L.tables[t].nodes.count
+    while i - n < count {
+        slot := i - n
+        if L.tables[t].nodes[slot].key.t != LUA_TNIL && L.tables[t].nodes[slot].value.t != LUA_TNIL { return i }
+        i += 1
+    }
+    return -1
+}
+
+// Position just after `key`, or -2 when the key is not in the table.
+PositionAfter :: (L: *LuaState, t: s32, key: LuaValue) -> s64 {
+    if key.t == LUA_TNIL { return 0 }
+    if key.t == LUA_TNUMBER {
+        i, ok := AsInteger(key.n)
+        if ok && i >= 1 && i <= L.tables[t].arr.count { return i }
+    }
+    slot := FindSlot(L, t, key)
+    if slot < 0 { return -2 }
+    return L.tables[t].arr.count + slot + 1
+}
+
+PositionKey :: (L: *LuaState, t: s32, position: s64) -> LuaValue #inline {
+    n := L.tables[t].arr.count
+    if position < n { return NumberValue(cast(float64)(position + 1)) }
+    return L.tables[t].nodes[position - n].key
+}
+
+PositionValue :: (L: *LuaState, t: s32, position: s64) -> LuaValue #inline {
+    n := L.tables[t].arr.count
+    if position < n { return L.tables[t].arr[position] }
+    return L.tables[t].nodes[position - n].value
+}
+
+// next(t, key): writes the following pair; false at the end. Returns
+// ok=false (with done=false) when the key is invalid.
+TableNext :: (L: *LuaState, t: s32, key: LuaValue, out_key: *LuaValue, out_value: *LuaValue) -> (found: bool, ok: bool) {
+    from := PositionAfter(L, t, key)
+    if from == -2 { return false, false }
+    position := NextPosition(L, t, from)
+    if position < 0 { return false, true }
+    <<out_key = PositionKey(L, t, position)
+    <<out_value = PositionValue(L, t, position)
+    return true, true
+}
+
+// Metamethod lookup on a metatable with the absent-bit cache.
+FastTM :: (L: *LuaState, mt: s32, event: s32) -> LuaValue #inline {
+    if mt < 0 { return NilValue() }
+    if (L.tables[mt].absent & (cast(u32) 1 << cast(u32) event)) != 0 { return NilValue() }
+    v := GetStr(L, mt, L.tm_names[event])
+    if v.t == LUA_TNIL { L.tables[mt].absent |= cast(u32) 1 << cast(u32) event }
+    return v
+}
+
+MetatableOf :: (L: *LuaState, v: LuaValue) -> s32 {
+    if v.t == LUA_TTABLE { return L.tables[v.h].meta }
+    if v.t == LUA_TUSERDATA { return L.userdata[v.h].meta }
+    if v.t <= LUA_TLIGHTUSERDATA { return L.type_meta[v.t] }
+    return -1
+}
+
+GetTM :: (L: *LuaState, v: LuaValue, event: s32) -> LuaValue {
+    return FastTM(L, MetatableOf(L, v), event)
+}

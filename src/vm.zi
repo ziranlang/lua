@@ -1,0 +1,32 @@
+// A Lua 5.1 virtual machine in Ziran, following the LuaJIT dialect that
+// Luanti mods use: lexer, parser, register compiler, interpreter, garbage
+// collector, the standard libraries (base, coroutine, string, table, math,
+// a sandboxed os/io subset, bit, debug) and an embedding API modeled on the
+// C API. docs/API.md documents the embedding API.
+
+#import "vec"
+#import "std/math"
+#import "std/format"
+#import "std/float_text"
+#import "std/file"
+#import "std/environment_linux"
+#import "std/date_time_types"
+#import "std/date_time_linux"
+#import "std/timer_linux"
+
+#load "value.zi";
+#load "number.zi";
+#load "table.zi";
+#load "lexer.zi";
+#load "parser.zi";
+#load "compiler.zi";
+#load "interp.zi";
+#load "gc.zi";
+#load "api.zi";
+#load "lib_base.zi";
+#load "lib_string.zi";
+#load "lib_table.zi";
+#load "lib_math.zi";
+#load "lib_os.zi";
+#load "lib_bit.zi";
+#load "lib_debug.zi";

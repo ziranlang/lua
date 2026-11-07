@@ -1,0 +1,595 @@
+// Sandboxed os and io subsets: clocks and dates, environment reads the host
+// allows, io.write through the print sink and read-only files under the
+// file root. Nothing here writes files or runs processes.
+
+#scope_module
+
+DaysFromCivil :: (year: s64, month: s64, day: s64) -> s64 {
+    y := ifx month <= 2 then year - 1 else year
+    era := (ifx y >= 0 then y else y - 399) / 400
+    yoe := y - era * 400
+    mp := ifx month > 2 then month - 3 else month + 9
+    doy := (153 * mp + 2) / 5 + day - 1
+    doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+FloorDiv :: (a: s64, b: s64) -> s64 #inline {
+    q := a / b
+    if (a % b != 0) && ((a < 0) != (b < 0)) { q -= 1 }
+    return q
+}
+
+CivilSeconds :: (when: LocalDateTime) -> s64 {
+    days := DaysFromCivil(cast(s64) when.year, cast(s64) when.month, cast(s64) when.day)
+    return days * 86400 + cast(s64) when.hour * 3600 + cast(s64) when.minute * 60 + cast(s64) when.second
+}
+
+// 0 = Sunday.
+WeekDay :: (when: LocalDateTime) -> s64 {
+    days := DaysFromCivil(cast(s64) when.year, cast(s64) when.month, cast(s64) when.day)
+    w := (days + 4) % 7
+    if w < 0 { w += 7 }
+    return w
+}
+
+FieldInteger :: (L: *LuaState, t: s32, name: string, fallback: s64, required: bool, ok: *bool) -> s64 {
+    v := GetStr(L, t, Intern(L, name))
+    if v.t == LUA_TNUMBER { return SafeInteger(Floor(v.n)) }
+    if v.t == LUA_TSTRING {
+        n, converted := ParseNumberText(StrView(L, v.h))
+        if converted { return SafeInteger(Floor(n)) }
+    }
+    if required {
+        text: Vec(u8)
+        BuilderAppend(text, "field '")
+        BuilderAppend(text, name)
+        BuilderAppend(text, "' missing in date table")
+        LuaErrorText(L, BytesView(*text))
+        VecFree(text)
+        <<ok = false
+    }
+    return fallback
+}
+
+OsTime :: (L: *LuaState) -> s32 {
+    v := Arg(L, 1)
+    if v.t == LUA_TNIL { return ReturnValue(L, NumberValue(cast(float64) UnixNow())) }
+    if v.t != LUA_TTABLE { return LuaTypeError(L, 1, "table") }
+    ok := true
+    t := v.h
+    second := FieldInteger(L, t, "sec", 0, false, *ok)
+    minute := FieldInteger(L, t, "min", 0, false, *ok)
+    hour := FieldInteger(L, t, "hour", 12, false, *ok)
+    day := FieldInteger(L, t, "day", 0, true, *ok)
+    if !ok { return LUA_NATIVE_ERROR }
+    month := FieldInteger(L, t, "month", 0, true, *ok)
+    if !ok { return LUA_NATIVE_ERROR }
+    year := FieldInteger(L, t, "year", 0, true, *ok)
+    if !ok { return LUA_NATIVE_ERROR }
+    // Normalize the month like mktime; days, hours and so on add linearly.
+    year += FloorDiv(month - 1, 12)
+    month = month - 1 - FloorDiv(month - 1, 12) * 12 + 1
+    guess := DaysFromCivil(year, month, 1) * 86400 + (day - 1) * 86400 + hour * 3600 + minute * 60 + second
+    // The fields are local time: subtract the zone offset at that moment.
+    local := LocalAt(guess)
+    if local.valid {
+        offset := CivilSeconds(local) - guess
+        result := guess - offset
+        again := LocalAt(result)
+        if again.valid { result = guess - (CivilSeconds(again) - result) }
+        return ReturnValue(L, NumberValue(cast(float64) result))
+    }
+    return ReturnValue(L, NumberValue(cast(float64) guess))
+}
+
+OsClock :: (L: *LuaState) -> s32 {
+    elapsed := MonotonicNanoseconds() - L.clock_start
+    return ReturnValue(L, NumberValue(cast(float64) elapsed / 1000000000.0))
+}
+
+OsDifftime :: (L: *LuaState) -> s32 {
+    a, ok1 := LuaCheckNumber(L, 1)
+    if !ok1 { return LUA_NATIVE_ERROR }
+    b, ok2 := LuaOptNumber(L, 2, 0.0)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    return ReturnValue(L, NumberValue(a - b))
+}
+
+DAY_NAMES :: "SunMonTueWedThuFriSat";
+MONTH_NAMES :: "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+DayFullName :: (w: s64) -> string {
+    if w == 0 { return "Sunday" }
+    if w == 1 { return "Monday" }
+    if w == 2 { return "Tuesday" }
+    if w == 3 { return "Wednesday" }
+    if w == 4 { return "Thursday" }
+    if w == 5 { return "Friday" }
+    return "Saturday"
+}
+
+MonthFullName :: (m: s64) -> string {
+    if m == 1 { return "January" }
+    if m == 2 { return "February" }
+    if m == 3 { return "March" }
+    if m == 4 { return "April" }
+    if m == 5 { return "May" }
+    if m == 6 { return "June" }
+    if m == 7 { return "July" }
+    if m == 8 { return "August" }
+    if m == 9 { return "September" }
+    if m == 10 { return "October" }
+    if m == 11 { return "November" }
+    return "December"
+}
+
+AppendTwo :: (out: *Vec(u8), value: s64, pad: u8) {
+    if value < 10 {
+        VecPush(<<out, pad)
+        VecPush(<<out, cast(u8)(#char "0" + value))
+        return
+    }
+    Append(out, value)
+}
+
+AppendDateField :: (out: *Vec(u8), conv: u8, when: LocalDateTime, utc: bool) -> bool {
+    wday := WeekDay(when)
+    if conv == #char "a" { BuilderAppend(<<out, DAY_NAMES[wday * 3:wday * 3 + 3]) }
+    else if conv == #char "A" { BuilderAppend(<<out, DayFullName(wday)) }
+    else if conv == #char "b" || conv == #char "h" {
+        m := cast(s64)(when.month - 1)
+        BuilderAppend(<<out, MONTH_NAMES[m * 3:m * 3 + 3])
+    }
+    else if conv == #char "B" { BuilderAppend(<<out, MonthFullName(cast(s64) when.month)) }
+    else if conv == #char "c" {
+        AppendDateField(out, #char "a", when, utc)
+        VecPush(<<out, #char " ")
+        AppendDateField(out, #char "b", when, utc)
+        VecPush(<<out, #char " ")
+        AppendTwo(out, cast(s64) when.day, #char " ")
+        VecPush(<<out, #char " ")
+        AppendDateField(out, #char "X", when, utc)
+        VecPush(<<out, #char " ")
+        Append(out, cast(s64) when.year)
+    }
+    else if conv == #char "d" { AppendTwo(out, cast(s64) when.day, #char "0") }
+    else if conv == #char "e" { AppendTwo(out, cast(s64) when.day, #char " ") }
+    else if conv == #char "D" || conv == #char "x" {
+        AppendTwo(out, cast(s64) when.month, #char "0")
+        VecPush(<<out, #char "/")
+        AppendTwo(out, cast(s64) when.day, #char "0")
+        VecPush(<<out, #char "/")
+        AppendTwo(out, cast(s64)(when.year % 100), #char "0")
+    }
+    else if conv == #char "F" {
+        Append(out, cast(s64) when.year)
+        VecPush(<<out, #char "-")
+        AppendTwo(out, cast(s64) when.month, #char "0")
+        VecPush(<<out, #char "-")
+        AppendTwo(out, cast(s64) when.day, #char "0")
+    }
+    else if conv == #char "H" { AppendTwo(out, cast(s64) when.hour, #char "0") }
+    else if conv == #char "I" {
+        h := cast(s64) when.hour % 12
+        AppendTwo(out, ifx h == 0 then 12 else h, #char "0")
+    }
+    else if conv == #char "j" {
+        yday := cast(s64) when.day_of_year + 1
+        if yday < 100 { VecPush(<<out, #char "0") }
+        if yday < 10 { VecPush(<<out, #char "0") }
+        Append(out, yday)
+    }
+    else if conv == #char "m" { AppendTwo(out, cast(s64) when.month, #char "0") }
+    else if conv == #char "M" { AppendTwo(out, cast(s64) when.minute, #char "0") }
+    else if conv == #char "n" { VecPush(<<out, 10) }
+    else if conv == #char "p" { BuilderAppend(<<out, ifx when.hour < 12 then "AM" else "PM") }
+    else if conv == #char "S" { AppendTwo(out, cast(s64) when.second, #char "0") }
+    else if conv == #char "t" { VecPush(<<out, 9) }
+    else if conv == #char "T" || conv == #char "X" {
+        AppendTwo(out, cast(s64) when.hour, #char "0")
+        VecPush(<<out, #char ":")
+        AppendTwo(out, cast(s64) when.minute, #char "0")
+        VecPush(<<out, #char ":")
+        AppendTwo(out, cast(s64) when.second, #char "0")
+    }
+    else if conv == #char "w" { Append(out, wday) }
+    else if conv == #char "y" { AppendTwo(out, cast(s64)(when.year % 100), #char "0") }
+    else if conv == #char "Y" { Append(out, cast(s64) when.year) }
+    else if conv == #char "Z" { BuilderAppend(<<out, ifx utc then "UTC" else "") }
+    else if conv == #char "%" { VecPush(<<out, #char "%") }
+    else { return false }
+    return true
+}
+
+OsDate :: (L: *LuaState) -> s32 {
+    format, ok := LuaOptString(L, 1, "%c")
+    if !ok { return LUA_NATIVE_ERROR }
+    seconds: s64 = 0
+    if Arg(L, 2).t == LUA_TNIL {
+        seconds = UnixNow()
+    } else {
+        n, okn := LuaCheckNumber(L, 2)
+        if !okn { return LUA_NATIVE_ERROR }
+        seconds = SafeInteger(Floor(n))
+    }
+    utc := false
+    text := format
+    if text.count > 0 && text[0] == #char "!" {
+        utc = true
+        text = text[1:]
+    }
+    when := ifx utc then UtcAt(seconds) else LocalAt(seconds)
+    if !when.valid { return ReturnNil(L) }
+    if text.count >= 2 && text[0] == #char "*" && text[1] == #char "t" {
+        t := NewTable(L, 0, 9)
+        SetValue(L, t, "year", NumberValue(cast(float64) when.year))
+        SetValue(L, t, "month", NumberValue(cast(float64) when.month))
+        SetValue(L, t, "day", NumberValue(cast(float64) when.day))
+        SetValue(L, t, "hour", NumberValue(cast(float64) when.hour))
+        SetValue(L, t, "min", NumberValue(cast(float64) when.minute))
+        SetValue(L, t, "sec", NumberValue(cast(float64) when.second))
+        SetValue(L, t, "wday", NumberValue(cast(float64)(WeekDay(when) + 1)))
+        SetValue(L, t, "yday", NumberValue(cast(float64)(when.day_of_year + 1)))
+        SetValue(L, t, "isdst", BoolValue(false))
+        return ReturnValue(L, TableValue(t))
+    }
+    out: Vec(u8)
+    i: s64 = 0
+    while i < text.count {
+        c := text[i]
+        if c == #char "%" && i + 1 < text.count {
+            conv := text[i + 1]
+            if !AppendDateField(*out, conv, when, utc) {
+                VecPush(out, #char "%")
+                VecPush(out, conv)
+            }
+            i += 2
+            continue
+        }
+        VecPush(out, c)
+        i += 1
+    }
+    Push(L, StringValue(InternBytes(L, *out)))
+    VecFree(out)
+    return 1
+}
+
+// Allowed when a host prefix (separated by 0 bytes) starts the name.
+EnvironmentAllowed :: (L: *LuaState, name: string) -> bool {
+    prefixes := BytesView(*L.env_allow)
+    start: s64 = 0
+    i: s64 = 0
+    while i <= prefixes.count {
+        if i == prefixes.count || prefixes[i] == 0 {
+            length := i - start
+            if length > 0 && name.count >= length && name[0:length] == prefixes[start:i] { return true }
+            start = i + 1
+        }
+        i += 1
+    }
+    return false
+}
+
+OsGetenv :: (L: *LuaState) -> s32 {
+    name, ok := LuaCheckString(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    if name.count == 0 || name.count > 200 || !EnvironmentAllowed(L, name) { return ReturnNil(L) }
+    value := EnvironmentText(name)
+    if value.count == 0 { return ReturnNil(L) }
+    return ReturnValue(L, StringValue(Intern(L, value)))
+}
+
+// ---------------------------------------------------------------- io
+
+FILE_DATA :: 1;
+FILE_POSITION :: 2;
+FILE_CLOSED :: 3;
+FILE_TAG :: 0x4C554146;
+
+IoWrite :: (L: *LuaState) -> s32 {
+    n := ArgCount(L)
+    out: Vec(u8)
+    i: s32 = 1
+    while i <= n {
+        v := Arg(L, i)
+        if v.t == LUA_TSTRING {
+            BuilderAppend(out, StrView(L, v.h))
+        } else if v.t == LUA_TNUMBER {
+            AppendNumber(*out, v.n)
+        } else {
+            VecFree(out)
+            return LuaTypeError(L, i, "string")
+        }
+        i += 1
+    }
+    if out.count > 0 { EmitText(L, BytesView(*out)) }
+    VecFree(out)
+    return 0
+}
+
+// Methods on io.stdout/io.stderr: f:write(...) returns f.
+StdWrite :: (L: *LuaState) -> s32 {
+    n := ArgCount(L)
+    out: Vec(u8)
+    i: s32 = 2
+    while i <= n {
+        v := Arg(L, i)
+        if v.t == LUA_TSTRING {
+            BuilderAppend(out, StrView(L, v.h))
+        } else if v.t == LUA_TNUMBER {
+            AppendNumber(*out, v.n)
+        } else {
+            VecFree(out)
+            return LuaTypeError(L, i, "string")
+        }
+        i += 1
+    }
+    if out.count > 0 { EmitText(L, BytesView(*out)) }
+    VecFree(out)
+    return ReturnValue(L, Arg(L, 1))
+}
+
+StdNoop :: (L: *LuaState) -> s32 { return ReturnValue(L, Arg(L, 1)) }
+
+FileState :: (L: *LuaState, n: s32) -> s32 {
+    v := Arg(L, n)
+    if v.t == LUA_TUSERDATA && L.userdata[v.h].tag == FILE_TAG && L.userdata[v.h].env >= 0 {
+        return L.userdata[v.h].env
+    }
+    LuaTypeError(L, n, "FILE*")
+    return -1
+}
+
+OpenFileObject :: (L: *LuaState, path: string) -> bool {
+    full: Vec(u8)
+    if !ResolvePath(L, path, *full) {
+        VecFree(full)
+        return false
+    }
+    bytes: Vec(u8)
+    if !ReadFileInto(BytesView(*full), *bytes) {
+        VecFree(bytes)
+        VecFree(full)
+        return false
+    }
+    VecFree(full)
+    state := NewTable(L, 3, 0)
+    SetInt(L, state, FILE_DATA, StringValue(InternBytes(L, *bytes)))
+    SetInt(L, state, FILE_POSITION, NumberValue(0.0))
+    VecFree(bytes)
+    h := NewUserdataObject(L)
+    L.userdata[h].tag = FILE_TAG
+    L.userdata[h].env = state
+    L.userdata[h].meta = L.file_meta
+    Push(L, ObjectValue(LUA_TUSERDATA, h))
+    return true
+}
+
+IoOpen :: (L: *LuaState) -> s32 {
+    path, ok := LuaCheckString(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    mode, okm := LuaOptString(L, 2, "r")
+    if !okm { return LUA_NATIVE_ERROR }
+    if mode.count == 0 || mode[0] != #char "r" || (mode.count > 1 && mode[1] == #char "+") {
+        Push(L, NilValue())
+        text: Vec(u8)
+        BuilderAppend(text, path)
+        BuilderAppend(text, ": writing is not allowed in this sandbox")
+        Push(L, StringValue(InternBytes(L, *text)))
+        VecFree(text)
+        return 2
+    }
+    if OpenFileObject(L, path) { return 1 }
+    Push(L, NilValue())
+    text: Vec(u8)
+    BuilderAppend(text, path)
+    BuilderAppend(text, ": No such file or directory")
+    Push(L, StringValue(InternBytes(L, *text)))
+    VecFree(text)
+    Push(L, NumberValue(2.0))
+    return 3
+}
+
+// Read one item by format from the file state; false at end of file.
+ReadItem :: (L: *LuaState, state: s32, format: LuaValue, out: *LuaValue) -> bool {
+    data := StrView(L, GetInt(L, state, FILE_DATA).h)
+    position := SafeInteger(GetInt(L, state, FILE_POSITION).n)
+    if format.t == LUA_TNUMBER {
+        count := SafeInteger(format.n)
+        if position >= data.count && count > 0 { return false }
+        if position >= data.count { <<out = StringValue(Intern(L, "")); return true }
+        end := position + count
+        if end > data.count { end = data.count }
+        <<out = StringValue(Intern(L, data[position:end]))
+        SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) end))
+        return true
+    }
+    spec := ifx format.t == LUA_TSTRING then StrView(L, format.h) else "*l"
+    if spec.count > 0 && spec[0] == #char "*" { spec = spec[1:] }
+    kind: u8 = ifx spec.count > 0 then spec[0] else #char "l"
+    if kind == #char "a" {
+        <<out = StringValue(Intern(L, data[position:]))
+        SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) data.count))
+        return true
+    }
+    if kind == #char "n" {
+        at := position
+        while at < data.count && IsSpace(data[at]) { at += 1 }
+        end := at
+        while end < data.count && !IsSpace(data[end]) { end += 1 }
+        value, ok := ParseNumberText(data[at:end])
+        if !ok { return false }
+        <<out = NumberValue(value)
+        SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) end))
+        return true
+    }
+    if position >= data.count { return false }
+    end := position
+    while end < data.count && data[end] != 10 { end += 1 }
+    line_end := end
+    if kind == #char "L" && end < data.count { line_end = end + 1 }
+    <<out = StringValue(Intern(L, data[position:line_end]))
+    next := ifx end < data.count then end + 1 else end
+    SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) next))
+    return true
+}
+
+ReadFormats :: (L: *LuaState, state: s32, first: s32) -> s32 {
+    if Truthy(GetInt(L, state, FILE_CLOSED)) { return LuaErrorText(L, "attempt to use a closed file") }
+    n := ArgCount(L)
+    if n < first {
+        v: LuaValue
+        if !ReadItem(L, state, NilValue(), *v) { return ReturnNil(L) }
+        return ReturnValue(L, v)
+    }
+    count: s32 = 0
+    i := first
+    while i <= n {
+        v: LuaValue
+        if !ReadItem(L, state, Arg(L, i), *v) {
+            Push(L, NilValue())
+            return count + 1
+        }
+        Push(L, v)
+        count += 1
+        i += 1
+    }
+    return count
+}
+
+FileRead :: (L: *LuaState) -> s32 {
+    state := FileState(L, 1)
+    if state < 0 { return LUA_NATIVE_ERROR }
+    return ReadFormats(L, state, 2)
+}
+
+FileClose :: (L: *LuaState) -> s32 {
+    state := FileState(L, 1)
+    if state < 0 { return LUA_NATIVE_ERROR }
+    SetInt(L, state, FILE_CLOSED, BoolValue(true))
+    return ReturnValue(L, BoolValue(true))
+}
+
+FileSeek :: (L: *LuaState) -> s32 {
+    state := FileState(L, 1)
+    if state < 0 { return LUA_NATIVE_ERROR }
+    whence, ok := LuaOptString(L, 2, "cur")
+    if !ok { return LUA_NATIVE_ERROR }
+    offset, ok2 := LuaOptInteger(L, 3, 0)
+    if !ok2 { return LUA_NATIVE_ERROR }
+    size := cast(s64) StrView(L, GetInt(L, state, FILE_DATA).h).count
+    position := SafeInteger(GetInt(L, state, FILE_POSITION).n)
+    if whence == "set" { position = offset }
+    else if whence == "cur" { position += offset }
+    else if whence == "end" { position = size + offset }
+    else { return LuaArgError(L, 2, "invalid option") }
+    if position < 0 { position = 0 }
+    SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) position))
+    return ReturnValue(L, NumberValue(cast(float64) position))
+}
+
+FileLinesStep :: (L: *LuaState) -> s32 {
+    file := IndexValue(L, LuaUpvalueIndex(1))
+    state := L.userdata[file.h].env
+    if Truthy(GetInt(L, state, FILE_CLOSED)) { return LuaErrorText(L, "file is already closed") }
+    v: LuaValue
+    if !ReadItem(L, state, NilValue(), *v) { return ReturnNil(L) }
+    return ReturnValue(L, v)
+}
+
+FileLines :: (L: *LuaState) -> s32 {
+    state := FileState(L, 1)
+    if state < 0 { return LUA_NATIVE_ERROR }
+    Push(L, Arg(L, 1))
+    LuaPushNativeClosure(L, FileLinesStep, 1, "lines")
+    return 1
+}
+
+FileToString :: (L: *LuaState) -> s32 {
+    state := FileState(L, 1)
+    if state < 0 { return LUA_NATIVE_ERROR }
+    if Truthy(GetInt(L, state, FILE_CLOSED)) { return ReturnValue(L, StringValue(Intern(L, "file (closed)"))) }
+    text: Vec(u8)
+    BuilderAppend(text, "file (0x")
+    AppendHex(*text, cast(u64) Arg(L, 1).h, 8)
+    VecPush(text, #char ")")
+    Push(L, StringValue(InternBytes(L, *text)))
+    VecFree(text)
+    return 1
+}
+
+IoLines :: (L: *LuaState) -> s32 {
+    path, ok := LuaCheckString(L, 1)
+    if !ok { return LUA_NATIVE_ERROR }
+    if !OpenFileObject(L, path) {
+        text: Vec(u8)
+        BuilderAppend(text, path)
+        BuilderAppend(text, ": No such file or directory")
+        result := LuaErrorText(L, BytesView(*text))
+        VecFree(text)
+        return result
+    }
+    LuaPushNativeClosure(L, FileLinesStep, 1, "lines")
+    return 1
+}
+
+IoRead :: (L: *LuaState) -> s32 { return ReturnNil(L) }
+
+IoType :: (L: *LuaState) -> s32 {
+    v := Arg(L, 1)
+    if v.t == LUA_TUSERDATA && L.userdata[v.h].tag == FILE_TAG {
+        state := L.userdata[v.h].env
+        closed := Truthy(GetInt(L, state, FILE_CLOSED))
+        return ReturnValue(L, StringValue(Intern(L, ifx closed then "closed file" else "file")))
+    }
+    if v.t == LUA_TUSERDATA && L.userdata[v.h].tag == FILE_TAG + 1 {
+        return ReturnValue(L, StringValue(Intern(L, "file")))
+    }
+    return ReturnNil(L)
+}
+
+OpenOs :: (L: *LuaState) {
+    L.clock_start = MonotonicNanoseconds()
+    os := NewTable(L, 0, 8)
+    RegisterLibrary(L, "os", os)
+    SetNative(L, os, "time", OsTime)
+    SetNative(L, os, "clock", OsClock)
+    SetNative(L, os, "date", OsDate)
+    SetNative(L, os, "difftime", OsDifftime)
+    SetNative(L, os, "getenv", OsGetenv)
+
+    // File handles share one metatable with the methods as __index.
+    methods := NewTable(L, 0, 6)
+    SetNative(L, methods, "read", FileRead)
+    SetNative(L, methods, "lines", FileLines)
+    SetNative(L, methods, "close", FileClose)
+    SetNative(L, methods, "seek", FileSeek)
+    meta := NewTable(L, 0, 3)
+    SetStr(L, meta, L.tm_names[TM_INDEX], TableValue(methods))
+    SetNative(L, meta, "__tostring", FileToString)
+    L.file_meta = meta
+    SetStr(L, L.registry, Intern(L, "FILE*"), TableValue(meta))
+
+    io := NewTable(L, 0, 8)
+    RegisterLibrary(L, "io", io)
+    SetNative(L, io, "write", IoWrite)
+    SetNative(L, io, "read", IoRead)
+    SetNative(L, io, "open", IoOpen)
+    SetNative(L, io, "lines", IoLines)
+    SetNative(L, io, "type", IoType)
+    std_methods := NewTable(L, 0, 4)
+    SetNative(L, std_methods, "write", StdWrite)
+    SetNative(L, std_methods, "flush", StdNoop)
+    SetNative(L, std_methods, "setvbuf", StdNoop)
+    std_meta := NewTable(L, 0, 1)
+    SetStr(L, std_meta, L.tm_names[TM_INDEX], TableValue(std_methods))
+    i := 0
+    while i < 2 {
+        h := NewUserdataObject(L)
+        L.userdata[h].tag = FILE_TAG + 1
+        L.userdata[h].meta = std_meta
+        SetValue(L, io, ifx i == 0 then "stdout" else "stderr", ObjectValue(LUA_TUSERDATA, h))
+        i += 1
+    }
+}

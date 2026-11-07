@@ -1,0 +1,433 @@
+// Stop-the-world mark and sweep. Collection only starts at interpreter safe
+// points (allocation-heavy instructions and native returns) or on request,
+// so natives may hold object handles in locals while they run, as long as
+// they do not call back into Lua. Weak tables (__mode) and userdata __gc
+// finalizers follow Lua 5.1: strings are never removed from weak tables and
+// a finalized userdata is freed by the following cycle.
+
+#scope_module
+
+// Gray-stack tag for prototypes.
+LUA_TPROTO :: 11;
+
+MarkString :: (L: *LuaState, h: s32) #inline {
+    if h >= 0 { L.strings[h].mark = 1 }
+}
+
+MarkObject :: (L: *LuaState, t: u8, h: s32) {
+    if h < 0 { return }
+    if t == LUA_TTABLE {
+        if L.tables[h].mark != 0 { return }
+        L.tables[h].mark = 1
+    } else if t == LUA_TFUNCTION {
+        if L.closures[h].mark != 0 { return }
+        L.closures[h].mark = 1
+    } else if t == LUA_TUSERDATA {
+        if L.userdata[h].mark != 0 { return }
+        L.userdata[h].mark = 1
+    } else if t == LUA_TTHREAD {
+        if L.threads[h].mark != 0 { return }
+        L.threads[h].mark = 1
+    } else if t == LUA_TBOX {
+        if L.boxes[h].mark != 0 { return }
+        L.boxes[h].mark = 1
+    } else if t == LUA_TPROTO {
+        if L.protos[h].mark != 0 { return }
+        L.protos[h].mark = 1
+    } else {
+        return
+    }
+    VecPush(L.gray, ObjectValue(t, h))
+}
+
+MarkValue :: (L: *LuaState, v: LuaValue) #inline {
+    if v.t == LUA_TSTRING { L.strings[v.h].mark = 1; return }
+    if v.t >= LUA_TTABLE && v.t != LUA_TLIGHTUSERDATA { MarkObject(L, v.t, v.h) }
+}
+
+// Weak tables keep only strings (and plain values) in their weak parts.
+MarkWeakPart :: (L: *LuaState, v: LuaValue) #inline {
+    if v.t == LUA_TSTRING { L.strings[v.h].mark = 1 }
+}
+
+WeakMode :: (L: *LuaState, h: s32) -> (keys: bool, values: bool) {
+    meta := L.tables[h].meta
+    if meta < 0 { return false, false }
+    mode := GetStr(L, meta, L.tm_names[TM_MODE])
+    if mode.t != LUA_TSTRING { return false, false }
+    keys := false
+    values := false
+    i: s64 = 0
+    while i < L.strings[mode.h].bytes.count {
+        c := L.strings[mode.h].bytes[i]
+        if c == #char "k" { keys = true }
+        if c == #char "v" { values = true }
+        i += 1
+    }
+    return keys, values
+}
+
+TraverseTable :: (L: *LuaState, h: s32) {
+    meta := L.tables[h].meta
+    if meta >= 0 { MarkObject(L, LUA_TTABLE, meta) }
+    weak_keys, weak_values := WeakMode(L, h)
+    if weak_keys || weak_values { VecPush(L.weak, h) }
+    i: s64 = 0
+    n := L.tables[h].arr.count
+    while i < n {
+        v := L.tables[h].arr[i]
+        if weak_values { MarkWeakPart(L, v) } else { MarkValue(L, v) }
+        i += 1
+    }
+    i = 0
+    n = L.tables[h].nodes.count
+    while i < n {
+        node := L.tables[h].nodes[i]
+        if node.value.t != LUA_TNIL {
+            if weak_keys { MarkWeakPart(L, node.key) } else { MarkValue(L, node.key) }
+            if weak_values { MarkWeakPart(L, node.value) } else { MarkValue(L, node.value) }
+        }
+        i += 1
+    }
+}
+
+TraverseClosure :: (L: *LuaState, h: s32) {
+    if L.closures[h].proto >= 0 { MarkObject(L, LUA_TPROTO, L.closures[h].proto) }
+    if L.closures[h].env >= 0 { MarkObject(L, LUA_TTABLE, L.closures[h].env) }
+    MarkString(L, L.closures[h].name)
+    i: s64 = 0
+    while i < L.closures[h].upvals.count {
+        MarkObject(L, LUA_TBOX, L.closures[h].upvals[i])
+        i += 1
+    }
+    i = 0
+    while i < L.closures[h].native_upvals.count {
+        MarkValue(L, L.closures[h].native_upvals[i])
+        i += 1
+    }
+}
+
+TraverseProto :: (L: *LuaState, h: s32) {
+    MarkString(L, L.protos[h].source)
+    i: s64 = 0
+    while i < L.protos[h].constants.count {
+        MarkValue(L, L.protos[h].constants[i])
+        i += 1
+    }
+    i = 0
+    while i < L.protos[h].protos.count {
+        MarkObject(L, LUA_TPROTO, L.protos[h].protos[i])
+        i += 1
+    }
+    i = 0
+    while i < L.protos[h].upval_names.count {
+        MarkString(L, L.protos[h].upval_names[i])
+        i += 1
+    }
+    i = 0
+    while i < L.protos[h].locvars.count {
+        MarkString(L, L.protos[h].locvars[i].name)
+        i += 1
+    }
+}
+
+TraverseThread :: (L: *LuaState, h: s32) {
+    if L.threads[h].env >= 0 { MarkObject(L, LUA_TTABLE, L.threads[h].env) }
+    top := L.threads[h].top
+    if top > L.threads[h].stack.count { top = L.threads[h].stack.count }
+    i: s64 = 0
+    while i < top {
+        MarkValue(L, L.threads[h].stack[i])
+        i += 1
+    }
+    i = 0
+    while i < L.threads[h].frames.count {
+        MarkObject(L, LUA_TFUNCTION, L.threads[h].frames[i].closure)
+        i += 1
+    }
+    i = 0
+    while i < L.threads[h].handlers.count {
+        MarkValue(L, L.threads[h].handlers[i].handler)
+        i += 1
+    }
+}
+
+Propagate :: (L: *LuaState) {
+    while L.gray.count > 0 {
+        v := L.gray[L.gray.count - 1]
+        VecResize(L.gray, L.gray.count - 1)
+        t := v.t
+        if t == LUA_TTABLE {
+            TraverseTable(L, v.h)
+        } else if t == LUA_TFUNCTION {
+            TraverseClosure(L, v.h)
+        } else if t == LUA_TPROTO {
+            TraverseProto(L, v.h)
+        } else if t == LUA_TBOX {
+            MarkValue(L, L.boxes[v.h].value)
+        } else if t == LUA_TUSERDATA {
+            if L.userdata[v.h].meta >= 0 { MarkObject(L, LUA_TTABLE, L.userdata[v.h].meta) }
+            if L.userdata[v.h].env >= 0 { MarkObject(L, LUA_TTABLE, L.userdata[v.h].env) }
+        } else if t == LUA_TTHREAD {
+            TraverseThread(L, v.h)
+        }
+    }
+}
+
+MarkRoots :: (L: *LuaState) {
+    MarkObject(L, LUA_TTABLE, L.globals)
+    MarkObject(L, LUA_TTABLE, L.registry)
+    MarkObject(L, LUA_TTHREAD, L.main)
+    MarkObject(L, LUA_TTHREAD, L.cur)
+    MarkObject(L, LUA_TFUNCTION, L.next_fn)
+    MarkObject(L, LUA_TFUNCTION, L.inext_fn)
+    MarkObject(L, LUA_TTABLE, L.file_meta)
+    i: s64 = 0
+    while i < L.resumers.count {
+        MarkObject(L, LUA_TTHREAD, L.resumers[i])
+        i += 1
+    }
+    i = 0
+    while i < 11 {
+        if L.type_meta[i] >= 0 { MarkObject(L, LUA_TTABLE, L.type_meta[i]) }
+        i += 1
+    }
+    i = 0
+    while i < TM_COUNT {
+        MarkString(L, L.tm_names[i])
+        i += 1
+    }
+    MarkString(L, L.name_n)
+    MarkString(L, L.name_goto)
+    MarkString(L, L.name_self)
+    MarkString(L, L.name_loaded)
+    MarkValue(L, L.error)
+    i = 0
+    while i < L.pending_finalize.count {
+        MarkObject(L, LUA_TUSERDATA, L.pending_finalize[i])
+        i += 1
+    }
+}
+
+// An object a weak table may drop: unmarked tables, functions, userdata and
+// threads. Strings and plain values always stay.
+Unreachable :: (L: *LuaState, v: LuaValue) -> bool #inline {
+    if v.t == LUA_TTABLE { return L.tables[v.h].mark == 0 }
+    if v.t == LUA_TFUNCTION { return L.closures[v.h].mark == 0 }
+    if v.t == LUA_TUSERDATA { return L.userdata[v.h].mark == 0 }
+    if v.t == LUA_TTHREAD { return L.threads[v.h].mark == 0 }
+    return false
+}
+
+ClearWeak :: (L: *LuaState) {
+    w: s64 = 0
+    while w < L.weak.count {
+        h := L.weak[w]
+        weak_keys, weak_values := WeakMode(L, h)
+        if weak_values {
+            i: s64 = 0
+            while i < L.tables[h].arr.count {
+                if Unreachable(L, L.tables[h].arr[i]) { L.tables[h].arr[i] = NilValue() }
+                i += 1
+            }
+        }
+        i: s64 = 0
+        while i < L.tables[h].nodes.count {
+            if L.tables[h].nodes[i].value.t != LUA_TNIL {
+                drop := (weak_keys && Unreachable(L, L.tables[h].nodes[i].key)) || (weak_values && Unreachable(L, L.tables[h].nodes[i].value))
+                if drop { L.tables[h].nodes[i].value = NilValue() }
+            }
+            i += 1
+        }
+        w += 1
+    }
+    VecClear(L.weak)
+}
+
+// Unreachable userdata with a __gc metamethod survive one more cycle and are
+// queued for their finalizer.
+SeparateFinalizers :: (L: *LuaState) {
+    i: s64 = 0
+    while i < L.userdata.count {
+        if L.userdata[i].live && L.userdata[i].mark == 0 && !L.userdata[i].finalized {
+            meta := L.userdata[i].meta
+            if meta >= 0 && FastTM(L, meta, TM_GC).t != LUA_TNIL {
+                VecPush(L.pending_finalize, cast(s32) i)
+                MarkObject(L, LUA_TUSERDATA, cast(s32) i)
+            }
+        }
+        i += 1
+    }
+    Propagate(L)
+}
+
+Sweep :: (L: *LuaState) -> s64 {
+    size: s64 = 0
+    i: s64 = 0
+    while i < L.strings.count {
+        if L.strings[i].live {
+            if L.strings[i].mark == 0 && L.strings[i].reserved == 0 {
+                Unintern(L, cast(s32) i)
+                VecFree(L.strings[i].bytes)
+                L.strings[i].live = false
+                VecPush(L.string_free, cast(s32) i)
+            } else {
+                L.strings[i].mark = 0
+                size += 40 + L.strings[i].bytes.count
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < L.tables.count {
+        if L.tables[i].live {
+            if L.tables[i].mark == 0 {
+                VecFree(L.tables[i].arr)
+                VecFree(L.tables[i].nodes)
+                L.tables[i].live = false
+                L.tables[i].meta = -1
+                VecPush(L.table_free, cast(s32) i)
+            } else {
+                L.tables[i].mark = 0
+                size += 80 + L.tables[i].arr.count * 16 + L.tables[i].nodes.count * 32
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < L.closures.count {
+        if L.closures[i].live {
+            if L.closures[i].mark == 0 {
+                VecFree(L.closures[i].upvals)
+                VecFree(L.closures[i].native_upvals)
+                L.closures[i].live = false
+                VecPush(L.closure_free, cast(s32) i)
+            } else {
+                L.closures[i].mark = 0
+                size += 64 + L.closures[i].upvals.count * 4 + L.closures[i].native_upvals.count * 16
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < L.protos.count {
+        if L.protos[i].live {
+            if L.protos[i].mark == 0 {
+                VecFree(L.protos[i].code)
+                VecFree(L.protos[i].lines)
+                VecFree(L.protos[i].constants)
+                VecFree(L.protos[i].protos)
+                VecFree(L.protos[i].upvals)
+                VecFree(L.protos[i].upval_names)
+                VecFree(L.protos[i].locvars)
+                L.protos[i].live = false
+                VecPush(L.proto_free, cast(s32) i)
+            } else {
+                L.protos[i].mark = 0
+                size += 160 + L.protos[i].code.count * 20 + L.protos[i].constants.count * 16
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < L.boxes.count {
+        if L.boxes[i].live {
+            if L.boxes[i].mark == 0 {
+                L.boxes[i].live = false
+                L.boxes[i].value = NilValue()
+                VecPush(L.box_free, cast(s32) i)
+            } else {
+                L.boxes[i].mark = 0
+                size += 32
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < L.userdata.count {
+        if L.userdata[i].live {
+            if L.userdata[i].mark == 0 {
+                FreeUserdata(L, cast(s32) i)
+            } else {
+                L.userdata[i].mark = 0
+                size += 64
+            }
+        }
+        i += 1
+    }
+    i = 0
+    while i < L.threads.count {
+        if L.threads[i].live {
+            if L.threads[i].mark == 0 {
+                VecFree(L.threads[i].stack)
+                VecFree(L.threads[i].frames)
+                VecFree(L.threads[i].handlers)
+                L.threads[i].live = false
+                VecPush(L.thread_free, cast(s32) i)
+            } else {
+                L.threads[i].mark = 0
+                size += 160 + L.threads[i].stack.count * 16 + L.threads[i].frames.count * 64
+            }
+        }
+        i += 1
+    }
+    return size
+}
+
+FreeUserdata :: (L: *LuaState, h: s32) {
+    if L.userdata[h].has_finalizer {
+        finalizer := L.userdata[h].finalizer
+        L.userdata[h].has_finalizer = false
+        finalizer(L, L.userdata[h].data, L.userdata[h].tag)
+    }
+    L.userdata[h].live = false
+    L.userdata[h].data = null
+    L.userdata[h].meta = -1
+    L.userdata[h].env = -1
+    VecPush(L.userdata_free, h)
+}
+
+// A full collection followed by pending __gc finalizers.
+CollectGarbage :: (L: *LuaState) {
+    if L.collecting { return }
+    L.collecting = true
+    VecClear(L.gray)
+    VecClear(L.weak)
+    MarkRoots(L)
+    Propagate(L)
+    SeparateFinalizers(L)
+    ClearWeak(L)
+    size := Sweep(L)
+    L.allocated = size
+    L.threshold = size * 2
+    if L.threshold < 1048576 { L.threshold = 1048576 }
+    L.collecting = false
+    RunFinalizers(L)
+}
+
+RunFinalizers :: (L: *LuaState) {
+    if L.pending_finalize.count == 0 { return }
+    L.collecting = true
+    while L.pending_finalize.count > 0 {
+        h := L.pending_finalize[L.pending_finalize.count - 1]
+        VecResize(L.pending_finalize, L.pending_finalize.count - 1)
+        if !L.userdata[h].live { continue }
+        L.userdata[h].finalized = true
+        value := ObjectValue(LUA_TUSERDATA, h)
+        tm := GetTM(L, value, TM_GC)
+        if tm.t == LUA_TNIL { continue }
+        th := L.cur
+        top := L.threads[th].top
+        if !EnsureStack(L, top + 3) { continue }
+        L.threads[th].stack[top] = tm
+        L.threads[th].stack[top + 1] = value
+        L.threads[th].top = top + 2
+        saved_error := L.error
+        saved_traced := L.error_traced
+        ProtectedCall(L, top, 1, 0, NilValue())
+        L.error = saved_error
+        L.error_traced = saved_traced
+        L.threads[th].top = top
+    }
+    L.collecting = false
+}
