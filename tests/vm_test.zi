@@ -1,0 +1,26 @@
+// Runs Lua snippets through the embedding API; each must finish without error.
+#import "vec"
+#import "vm"
+
+Check :: (L: *LuaState, name: string, source: string) -> bool {
+    status := LuaDoString(L, source, name)
+    if status != LUA_OK {
+        message, ok := LuaToString(L, -1)
+        print("FAIL %: %\n", name, message)
+        LuaSetTop(L, 0)
+        return false
+    }
+    LuaSetTop(L, 0)
+    return true
+}
+
+Main :: () -> s32 {
+    L: LuaState
+    LuaOpen(*L)
+    failures := 0
+    if !Check(*L, "=smoke", "local x = 1 + 2 assert(x == 3) print('smoke ok', x)") { failures += 1 }
+    LuaClose(*L)
+    if failures > 0 { return 1 }
+    print("vm tests passed\n")
+    return 0
+}

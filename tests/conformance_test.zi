@@ -1,0 +1,68 @@
+// Runs every tests/lua/*.lua script in a fresh state. A script passes when
+// it finishes without error; scripts check themselves with assert.
+#import "vec"
+#import "std/file"
+#import "std/file_tree_linux"
+#import "vm"
+
+Quiet :: (context: *void, text: string) {
+    counter := cast(*s64) context
+    <<counter += text.count
+}
+
+RunScript :: (directory: string, name: string) -> bool {
+    path: Vec(u8)
+    BuilderAppend(path, directory)
+    VecPush(path, #char "/")
+    BuilderAppend(path, name)
+    source: Vec(u8)
+    if !ReadFileInto(TextView(VecSlice(path, 0, path.count)), *source) {
+        print("FAIL %: cannot read\n", name)
+        return false
+    }
+    chunk: Vec(u8)
+    VecPush(chunk, #char "@")
+    BuilderAppend(chunk, name)
+    L: LuaState
+    LuaOpen(*L)
+    printed: s64 = 0
+    LuaSetPrintSink(*L, Quiet, cast(*void) *printed)
+    passed := true
+    status := LuaLoadBuffer(*L, TextView(VecSlice(source, 0, source.count)), TextView(VecSlice(chunk, 0, chunk.count)))
+    if status == LUA_OK { status = LuaPCall(*L, 0, 0, 0) }
+    if status != LUA_OK {
+        message, ok := LuaToString(*L, -1)
+        print("FAIL %: %\n", name, message)
+        passed = false
+    } else {
+        print("PASS %\n", name)
+    }
+    LuaClose(*L)
+    VecFree(chunk)
+    VecFree(source)
+    VecFree(path)
+    return passed
+}
+
+Main :: () -> s32 {
+    directory := "tests/lua"
+    names: Vec(string)
+    if !ListDirectory(directory, *names) {
+        print("FAIL cannot list %\n", directory)
+        return 1
+    }
+    total := 0
+    failures := 0
+    i: s64 = 0
+    while i < names.count {
+        name := names[i]
+        if name.count > 4 && name[name.count - 4:] == ".lua" {
+            total += 1
+            if !RunScript(directory, name) { failures += 1 }
+        }
+        i += 1
+    }
+    print("conformance: % of % scripts passed\n", total - failures, total)
+    if failures > 0 || total == 0 { return 1 }
+    return 0
+}

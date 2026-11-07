@@ -1,0 +1,76 @@
+// Compiles every .lua file below the Katalis mods folder (KATALIS_MODS, or
+// the default checkout path) and reports any that fail to load.
+#import "vec"
+#import "std/file"
+#import "std/file_tree_linux"
+#import "std/environment_linux"
+#import "vm"
+
+Counts :: struct {
+    files: s64
+    failures: s64
+}
+
+CheckFile :: (L: *LuaState, path: string, counts: *Counts) {
+    source: Vec(u8)
+    counts.files += 1
+    if !ReadFileInto(path, *source) {
+        print("FAIL %: cannot read\n", path)
+        counts.failures += 1
+        return
+    }
+    chunk: Vec(u8)
+    VecPush(chunk, #char "@")
+    BuilderAppend(chunk, path)
+    status := LuaLoadBuffer(L, TextView(VecSlice(source, 0, source.count)), TextView(VecSlice(chunk, 0, chunk.count)))
+    if status != LUA_OK {
+        message, ok := LuaToString(L, -1)
+        print("FAIL %\n", message)
+        counts.failures += 1
+    }
+    LuaSetTop(L, 0)
+    VecFree(chunk)
+    VecFree(source)
+}
+
+Walk :: (L: *LuaState, directory: string, counts: *Counts) {
+    names: Vec(string)
+    if !ListDirectory(directory, *names) {
+        print("FAIL cannot list %\n", directory)
+        counts.failures += 1
+        return
+    }
+    i: s64 = 0
+    while i < names.count {
+        name := names[i]
+        path: Vec(u8)
+        BuilderAppend(path, directory)
+        VecPush(path, #char "/")
+        BuilderAppend(path, name)
+        full := TextView(VecSlice(path, 0, path.count))
+        if IsDirectory(full) {
+            Walk(L, full, counts)
+        } else if name.count > 4 && name[name.count - 4:] == ".lua" {
+            CheckFile(L, full, counts)
+        }
+        VecFree(path)
+        i += 1
+    }
+}
+
+Main :: () -> s32 {
+    root := EnvironmentText("KATALIS_MODS")
+    if root.count == 0 { root = "/mnt/storage/Projects/waozixyz/katalis/mods" }
+    if !IsDirectory(root) {
+        print("SKIP katalis mods: % not found\n", root)
+        return 0
+    }
+    L: LuaState
+    LuaOpen(*L)
+    counts: Counts
+    Walk(*L, root, *counts)
+    LuaClose(*L)
+    print("katalis mods: % of % files load\n", counts.files - counts.failures, counts.files)
+    if counts.failures > 0 || counts.files == 0 { return 1 }
+    return 0
+}
