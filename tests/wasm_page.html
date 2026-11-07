@@ -1,0 +1,17 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>lua wasm32 test</title>
+<pre id="lua-output"></pre>
+<script>
+// Emscripten writes stdout and stderr with console.log and console.error
+// (bound when its script loads), and declares globals such as `out`, so
+// this page captures the console under names of its own.
+(function () {
+  var element = document.getElementById("lua-output");
+  function append(text) { element.textContent += text + "\n"; }
+  console.log = append;
+  console.error = append;
+  window.addEventListener("error", function (event) { append("ERROR " + event.message); });
+})();
+</script>
+<script src="wasm_test.js"></script>

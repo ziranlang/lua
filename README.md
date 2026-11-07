@@ -59,4 +59,6 @@ make test
 
 This runs the API unit tests, the Lua scripts in `tests/lua`, and loads
 every `.lua` file of the Katalis mods (set `KATALIS_MODS` to another
-folder; it is skipped when missing).
+folder; it is skipped when missing). `make wasm` (part of `make test`) builds
+the VM for wasm32 with Emscripten and runs it in a private headless Chromium;
+set `EMCC` and `CHROMIUM` if they are elsewhere (it is skipped without them).

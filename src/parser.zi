@@ -63,9 +63,6 @@ OPR_LEN :: 2;
 
 UNARY_PRIORITY :: 8;
 
-// Exported only because Ziran cannot yet index a Vec of a module-scope
-// record from another #load file; not part of the API.
-#scope_export
 LuaSyntaxNode :: struct {
     kind: u8
     op: u8
@@ -79,7 +76,6 @@ LuaSyntaxNode :: struct {
     num: float64
     str: s32
 }
-#scope_module
 
 Parser :: struct {
     lx: Lexer

@@ -94,9 +94,7 @@ RawEqual :: (a: LuaValue, b: LuaValue) -> bool #inline {
     return a.h == b.h
 }
 
-// The object records live in the state's arenas. They are exported with
-// LuaState (whose fields hold them) but are not part of the stable API.
-#scope_export
+// The object records live in the state's arenas.
 
 LuaString :: struct {
     bytes: Vec(u8)
@@ -242,8 +240,6 @@ LuaThread :: struct {
     env: s32
 }
 
-#scope_module
-
 // Metamethod indices.
 TM_INDEX :: 0;
 TM_NEWINDEX :: 1;
@@ -358,19 +354,12 @@ LuaState :: struct {
 #scope_module
 
 // String bytes as a borrowed view. Valid until the string is collected;
-// the bytes never move while the string lives.
-// Ziran has no portable way to borrow a Vec(u8) held behind a pointer as a
-// string whose lifetime the checker can follow, so the VM builds the string
-// descriptor itself, the way std/byte_text_linux.zi does (C target).
-RawText :: struct { data: *u8; length: u64; }
-
+// the bytes never move while the string lives. std's BytesFromPointer
+// borrows them with the target's own slice layout (size_t lengths on
+// wasm32 too).
 ViewOf :: (first: *u8, count: s64) -> string #inline {
-    result: string = ""
-    if count <= 0 { return result }
-    descriptor: *RawText = cast(*RawText)(*result)
-    descriptor.data = first
-    descriptor.length = cast(u64) count
-    return result
+    if count <= 0 { return "" }
+    return TextView(BytesFromPointer(first, cast(u64) count))
 }
 
 StrView :: (L: *LuaState, h: s32) -> string #inline {

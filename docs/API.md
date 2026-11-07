@@ -3,9 +3,9 @@
 `#import "lua/vm"` gives a Lua 5.1 virtual machine (LuaJIT dialect) written
 in Ziran. The API follows the shape of the Lua C API: a host owns a
 `LuaState` record, values move through a stack, and natives are plain Ziran
-procedures. Names below are stable; records not listed here (`LuaTable`,
-`LuaClosure` and the other object records exported with `LuaState`) are
-internal and may change.
+procedures. Names below are stable. Use `LuaState` only through them: its
+fields are internal, and the object records they hold are private to the
+package.
 
 ## State
 

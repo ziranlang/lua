@@ -1,0 +1,73 @@
+// Runs the VM on wasm32 (Emscripten, in a headless browser; see `make
+// wasm`): strings, numbers and error messages must survive the VM's string
+// views, whose length is size_t there.
+#import "vec"
+#import "vm"
+
+state: LuaState;
+failures: s64 = 0;
+
+Contains :: (text: string, part: string) -> bool {
+    i: s64 = 0
+    while i + part.count <= text.count {
+        j: s64 = 0
+        while j < part.count && text[i + j] == part[j] { j += 1 }
+        if j == part.count { return true }
+        i += 1
+    }
+    return false
+}
+
+ExpectString :: (L: *LuaState, source: string, expected: string) {
+    status := LuaDoString(L, source, "=wasm")
+    text, ok := LuaToString(L, -1)
+    if status != LUA_OK || !ok || text != expected {
+        print("FAIL % -> status % '%' (expected '%')\n", source, status, text, expected)
+        failures += 1
+    }
+    LuaSetTop(L, 0)
+}
+
+ExpectNumber :: (L: *LuaState, source: string, expected: float64) {
+    status := LuaDoString(L, source, "=wasm")
+    if status != LUA_OK || LuaType(L, -1) != LUA_TYPE_NUMBER || LuaToNumber(L, -1) != expected {
+        text, ok := LuaToString(L, -1)
+        print("FAIL % -> status % '%'\n", source, status, text)
+        failures += 1
+    }
+    LuaSetTop(L, 0)
+}
+
+ExpectError :: (L: *LuaState, source: string, part: string) {
+    status := LuaDoString(L, source, "=wasm")
+    text, ok := LuaToString(L, -1)
+    if status == LUA_OK || !Contains(text, part) {
+        print("FAIL % -> status % '%' (expected an error with '%')\n", source, status, text, part)
+        failures += 1
+    }
+    LuaSetTop(L, 0)
+}
+
+Main :: () -> s32 {
+    L := *state
+    LuaOpen(L)
+    ExpectString(L, "return 'abc'", "abc")
+    ExpectNumber(L, "return 1 + 2", 3.0)
+    ExpectString(L, "return tostring(12)", "12")
+    ExpectString(L, "return ('x'):rep(3, ',') .. #'hello'", "x,x,x5")
+    ExpectString(L, "local t = {} for w in ('a b c'):gmatch('%a') do t[#t + 1] = w:upper() end return table.concat(t)", "ABC")
+    ExpectString(L, "return string.format('%5.2f|%d|%s|%x', 3.14159, 42, 'ok', 255)", " 3.14|42|ok|ff")
+    ExpectString(L, "local t = setmetatable({}, {__index = function(_, k) return k .. '!' end}) return t.hey", "hey!")
+    ExpectNumber(L, "return bit.band(0xff00, 0x0ff0) + tonumber('0x10')", 3856.0)
+    ExpectNumber(L, "local co = coroutine.wrap(function(a) local b = coroutine.yield(a + 1) return b * 2 end) co(1) return co(21)", 42.0)
+    ExpectError(L, "error('xyz')", "wasm:1: xyz")
+    ExpectError(L, "local t = nil; return t.x", "attempt to index local 't' (a nil value)")
+    ExpectError(L, "return +", "wasm:1:")
+    LuaClose(L)
+    if failures > 0 {
+        print("wasm32: % failed\n", failures)
+        return 1
+    }
+    print("wasm32 strings ok\n")
+    return 0
+}
