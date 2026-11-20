@@ -3,8 +3,8 @@ name = "lua"
 module_roots = ["src", "tests"]
 
 [toolchain]
-git = "https://github.com/ziranlang/ziran.git"
-ref = "master"
+git = "https://git.waozi.xyz/ziranlang/ziran.git"
+ref = "88b505bf5f2342d46ed857c2d9160d5da9bec3a2"
 
 [exports]
 vm = "src/vm.zi"

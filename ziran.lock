@@ -9,7 +9,7 @@
   },
   "toolchain": {
     "commit": "88b505bf5f2342d46ed857c2d9160d5da9bec3a2",
-    "ref": "master",
-    "url": "https://github.com/ziranlang/ziran.git"
+    "ref": "88b505bf5f2342d46ed857c2d9160d5da9bec3a2",
+    "url": "https://git.waozi.xyz/ziranlang/ziran.git"
   }
 }

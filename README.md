@@ -1,11 +1,11 @@
 # Lua
 
-Lua is a [Ziran](https://github.com/ziranlang/ziran) package that runs Lua
+Lua is a [Ziran](https://git.waozi.xyz/ziranlang/ziran) package that runs Lua
 5.1 code in the LuaJIT dialect. Everything is written in Ziran, with no C
 code and no native libraries: the lexer and parser, a compiler to register
 bytecode, the interpreter, a mark-and-sweep collector with weak tables and
 `__gc`, and the standard libraries. It was written so that
-[Katalis](https://github.com/waozixyz/katalis) can run Luanti mods from
+[Katalis](https://git.waozi.xyz/waozi/katalis) can run Luanti mods from
 ContentDB.
 
 The embedding API follows the Lua C API: a stack, natives as plain Ziran
@@ -17,7 +17,7 @@ the host grants it.
 ## Use it
 
 ```sh
-ziran add https://github.com/ziranlang/lua.git
+ziran add https://git.waozi.xyz/ziranlang/lua.git
 ```
 
 ```zi
