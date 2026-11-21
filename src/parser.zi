@@ -193,7 +193,9 @@ ParseReturn :: (p: *Parser) -> s32 {
     s := AddNode(p, S_RETURN, p.lx.tok.line)
     NextToken(*p.lx)
     if !BlockFollow(p.lx.tok.kind) && p.lx.tok.kind != #char ";" {
-        p.nodes[s].a = ParseExprList(p)
+        // Parsing the expressions can reallocate the node buffer.
+        expressions := ParseExprList(p)
+        p.nodes[s].a = expressions
     }
     Accept(p, #char ";")
     return s
