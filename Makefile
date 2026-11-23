@@ -9,8 +9,6 @@ RUN := env -u DISPLAY -u WAYLAND_DISPLAY -u XAUTHORITY -u DBUS_SESSION_BUS_ADDRE
 # display). Chromium's socket path must stay short, so its TMPDIR is build/t.
 EMCC ?= $(HOME)/emsdk/upstream/emscripten/emcc
 CHROMIUM ?= chromium
-# Compiler runs outside ziran go through the shared build queue when present.
-QUEUE := $(if $(shell command -v build-queue),build-queue --,)
 WASM_LDFLAGS := -sSINGLE_FILE=1 -sWASM_ASYNC_COMPILATION=0 -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web -sSTACK_SIZE=1048576
 
 .PHONY: test unit conformance katalis wasm
@@ -36,7 +34,7 @@ wasm:
 	env CFLAGS=-O0 $(ZIRAN) build --project $(LOCKED) --target=c --define PLATFORM_WEB --exe -o build/wasm --entry wasm_test:Main tests/wasm_test.zi; \
 	$(ZIRAN) compile-commands --project -o build/wasm/commands.json build/wasm; \
 	include=$$(sed -n 's/^ *"-I\(.*\)",*$$/\1/p' build/wasm/commands.json | grep -v '/build/wasm$$' | head -1); \
-	$(QUEUE) "$(EMCC)" -std=c99 -O2 -w -I build/wasm -I "$$include" build/wasm/*.c -lm $(WASM_LDFLAGS) -o build/wasm/wasm_test.js; \
+	"$(EMCC)" -std=c99 -O2 -w -I build/wasm -I "$$include" build/wasm/*.c -lm $(WASM_LDFLAGS) -o build/wasm/wasm_test.js; \
 	cp tests/wasm_page.html build/wasm/index.html; \
 	$(RUN) TMPDIR="$(CURDIR)/build/t" timeout 120 "$(CHROMIUM)" --headless --no-first-run \
 		--no-default-browser-check --disable-extensions --use-gl=disabled --disable-gpu \
