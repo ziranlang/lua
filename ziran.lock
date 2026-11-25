@@ -8,7 +8,7 @@
     "name": "lua"
   },
   "toolchain": {
-    "commit": "5db3d3c39425d5dfe4bfe4a84e6f6e2e5a810ad0",
+    "commit": "0affd948205733bc370b6802f9730d8edf5e1e35",
     "ref": "5db3d3c39425d5dfe4bfe4a84e6f6e2e5a810ad0",
     "url": "https://git.waozi.xyz/ziranlang/ziran.git"
   }
