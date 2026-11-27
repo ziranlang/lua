@@ -452,6 +452,19 @@ Intern :: (L: *LuaState, text: string) -> s32 {
     return handle
 }
 
+// Intern an arena substring without carrying an arena view across mutation.
+InternStringSpan :: (L: *LuaState, handle: s32, begin: s64, end: s64) -> s32 {
+    if begin == 0 && end == StrLen(L, handle) { return handle }
+    bytes: Vec(u8)
+    {
+        text := StrView(L, handle)
+        BuilderAppend(bytes, text[begin:end])
+    }
+    result := InternBytes(L, *bytes)
+    VecFree(bytes)
+    return result
+}
+
 InternBytes :: (L: *LuaState, bytes: *Vec(u8)) -> s32 {
     return Intern(L, BytesView(bytes))
 }

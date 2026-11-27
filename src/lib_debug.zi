@@ -60,10 +60,18 @@ HasOption :: (what: string, c: u8) -> bool {
     return false
 }
 
+InfoOptions :: struct {
+    source: bool
+    line: bool
+    upvalues: bool
+    name: bool
+    function: bool
+}
+
 // Fill the info table for closure cl, with frame details when frame >= 0.
-FillInfo :: (L: *LuaState, t: s32, what: string, cl: s32, thread: s32, frame: s64) {
+FillInfo :: (L: *LuaState, t: s32, options: InfoOptions, cl: s32, thread: s32, frame: s64) {
     p := L.closures[cl].proto
-    if HasOption(what, #char "S") {
+    if options.source {
         if p < 0 {
             SetValue(L, t, "source", StringValue(Intern(L, "=[C]")))
             SetValue(L, t, "short_src", StringValue(Intern(L, "[C]")))
@@ -83,16 +91,16 @@ FillInfo :: (L: *LuaState, t: s32, what: string, cl: s32, thread: s32, frame: s6
             SetValue(L, t, "lastlinedefined", NumberValue(cast(float64)(ifx main then -1 else L.protos[p].last_line)))
         }
     }
-    if HasOption(what, #char "l") {
+    if options.line {
         line: s32 = -1
         if frame >= 0 { line = FrameLine(L, thread, frame) }
         SetValue(L, t, "currentline", NumberValue(cast(float64) line))
     }
-    if HasOption(what, #char "u") {
+    if options.upvalues {
         n := ifx p < 0 then L.closures[cl].native_upvals.count else L.closures[cl].upvals.count
         SetValue(L, t, "nups", NumberValue(cast(float64) n))
     }
-    if HasOption(what, #char "n") && frame >= 0 {
+    if options.name && frame >= 0 {
         kind, name := FrameFunctionName(L, thread, frame)
         if kind != NAME_NONE {
             if name == -2 {
@@ -106,18 +114,26 @@ FillInfo :: (L: *LuaState, t: s32, what: string, cl: s32, thread: s32, frame: s6
             SetValue(L, t, "namewhat", StringValue(Intern(L, "")))
         }
     }
-    if HasOption(what, #char "f") { SetValue(L, t, "func", FunctionValue(cl)) }
+    if options.function { SetValue(L, t, "func", FunctionValue(cl)) }
 }
 
 DebugGetinfo :: (L: *LuaState) -> s32 {
     thread, shift := ThreadArg(L)
-    what, ok := LuaOptString(L, 2 + shift, "flnSu")
-    if !ok { return LUA_NATIVE_ERROR }
+    options: InfoOptions
+    {
+        what, ok := LuaOptString(L, 2 + shift, "flnSu")
+        if !ok { return LUA_NATIVE_ERROR }
+        if what.count > 0 && what[0] == #char ">" { what = what[1:] }
+        options.source = HasOption(what, #char "S")
+        options.line = HasOption(what, #char "l")
+        options.upvalues = HasOption(what, #char "u")
+        options.name = HasOption(what, #char "n")
+        options.function = HasOption(what, #char "f")
+    }
     target := Arg(L, 1 + shift)
-    if what.count > 0 && what[0] == #char ">" { what = what[1:] }
     t := NewTable(L, 0, 12)
     if target.t == LUA_TFUNCTION {
-        FillInfo(L, t, what, target.h, thread, -1)
+        FillInfo(L, t, options, target.h, thread, -1)
         return ReturnValue(L, TableValue(t))
     }
     if target.t != LUA_TNUMBER { return LuaArgError(L, 1 + shift, "function or level expected") }
@@ -125,7 +141,7 @@ DebugGetinfo :: (L: *LuaState) -> s32 {
     // Level 0 is getinfo itself on the running thread.
     frame := L.threads[thread].frames.count - 1 - level
     if level < 0 || frame < 0 { return ReturnNil(L) }
-    FillInfo(L, t, what, L.threads[thread].frames[frame].closure, thread, frame)
+    FillInfo(L, t, options, L.threads[thread].frames[frame].closure, thread, frame)
     return ReturnValue(L, TableValue(t))
 }
 

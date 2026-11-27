@@ -90,9 +90,18 @@ BaseToNumber :: (L: *LuaState) -> s32 {
         if converted { return ReturnValue(L, NumberValue(n)) }
         return ReturnNil(L)
     }
-    text, is_text := LuaCheckString(L, 1)
-    if !is_text { return LUA_NATIVE_ERROR }
-    if base < 2 || base > 36 { return LuaArgError(L, 2, "base out of range") }
+    parsed := NilValue()
+    invalid_base := base < 2 || base > 36
+    {
+        text, is_text := LuaCheckString(L, 1)
+        if !is_text { return LUA_NATIVE_ERROR }
+        if !invalid_base { parsed = BaseNumberValue(text, base) }
+    }
+    if invalid_base { return LuaArgError(L, 2, "base out of range") }
+    return ReturnValue(L, parsed)
+}
+
+BaseNumberValue :: (text: string, base: s64) -> LuaValue {
     at: s64 = 0
     while at < text.count && IsWhitespaceByte(text[at]) { at += 1 }
     negative := false
@@ -111,8 +120,8 @@ BaseToNumber :: (L: *LuaState) -> s32 {
         at += 1
     }
     while at < text.count && IsWhitespaceByte(text[at]) { at += 1 }
-    if digits == 0 || at != text.count { return ReturnNil(L) }
-    return ReturnValue(L, NumberValue(ifx negative then -value else value))
+    if digits == 0 || at != text.count { return NilValue() }
+    return NumberValue(ifx negative then -value else value)
 }
 
 BaseNext :: (L: *LuaState) -> s32 {
@@ -205,10 +214,14 @@ BaseAssert :: (L: *LuaState) -> s32 {
     if Truthy(Arg(L, 1)) { return ArgCount(L) }
     if ArgCount(L) < 2 { return LuaErrorText(L, "assertion failed!") }
     message := Arg(L, 2)
-    if message.t == LUA_TSTRING { return LuaErrorText(L, StrView(L, message.h)) }
-    if message.t == LUA_TNUMBER {
+    if message.t == LUA_TSTRING || message.t == LUA_TNUMBER {
         h, ok := ToStringHandle(L, message)
-        return LuaErrorText(L, StrView(L, h))
+        text: Vec(u8)
+        AppendWhere(L, *text, 1)
+        BuilderAppend(text, StrView(L, h))
+        SetError(L, StringValue(InternBytes(L, *text)))
+        VecFree(text)
+        return LUA_NATIVE_ERROR
     }
     SetError(L, message)
     return LUA_NATIVE_ERROR
@@ -359,22 +372,42 @@ LoadResult :: (L: *LuaState, status: s32, env: LuaValue) -> s32 {
     return 1
 }
 
+// Parsing may intern new strings, so keep both inputs outside the arena.
+BaseLoadText :: (L: *LuaState, env: LuaValue) -> s32 {
+    bytes: Vec(u8)
+    name_bytes: Vec(u8)
+    {
+        text, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        BuilderAppend(bytes, text)
+    }
+    name_ok: bool
+    {
+        name, ok := LuaOptString(L, 2, BytesView(*bytes))
+        name_ok = ok
+        if ok { BuilderAppend(name_bytes, name) }
+    }
+    if !name_ok { VecFree(bytes); return LUA_NATIVE_ERROR }
+    status := LoadChunk(L, BytesView(*bytes), BytesView(*name_bytes), -1)
+    VecFree(name_bytes)
+    VecFree(bytes)
+    return LoadResult(L, status, env)
+}
+
 BaseLoad :: (L: *LuaState) -> s32 {
     chunk := Arg(L, 1)
     env := Arg(L, 4)
-    if chunk.t == LUA_TSTRING || chunk.t == LUA_TNUMBER {
-        text, ok := LuaCheckString(L, 1)
-        name, ok2 := LuaOptString(L, 2, text)
-        if !ok2 { return LUA_NATIVE_ERROR }
-        status := LoadChunk(L, text, name, -1)
-        return LoadResult(L, status, env)
-    }
+    if chunk.t == LUA_TSTRING || chunk.t == LUA_TNUMBER { return BaseLoadText(L, env) }
     if chunk.t != LUA_TFUNCTION { return LuaTypeError(L, 1, "function") }
-    name, ok := LuaOptString(L, 2, "=(load)")
-    if !ok { return LUA_NATIVE_ERROR }
-    name_handle := Intern(L, name)
+    name_bytes: Vec(u8)
+    {
+        name, ok := LuaOptString(L, 2, "=(load)")
+        if !ok { return LUA_NATIVE_ERROR }
+        BuilderAppend(name_bytes, name)
+    }
     bytes: Vec(u8)
     if !ReadChunkPieces(L, *bytes) {
+        VecFree(name_bytes)
         VecFree(bytes)
         message := L.error
         L.error = NilValue()
@@ -382,18 +415,14 @@ BaseLoad :: (L: *LuaState) -> s32 {
         Push(L, message)
         return 2
     }
-    status := LoadChunk(L, BytesView(*bytes), StrView(L, name_handle), -1)
+    status := LoadChunk(L, BytesView(*bytes), BytesView(*name_bytes), -1)
+    VecFree(name_bytes)
     VecFree(bytes)
     return LoadResult(L, status, env)
 }
 
 BaseLoadString :: (L: *LuaState) -> s32 {
-    text, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
-    name, ok2 := LuaOptString(L, 2, text)
-    if !ok2 { return LUA_NATIVE_ERROR }
-    status := LoadChunk(L, text, name, -1)
-    return LoadResult(L, status, NilValue())
+    return BaseLoadText(L, NilValue())
 }
 
 // A path inside the file root; false when files are disabled or the path
@@ -454,17 +483,29 @@ LoadFileChunk :: (L: *LuaState, path: string) -> s32 {
 }
 
 BaseLoadFile :: (L: *LuaState) -> s32 {
-    path, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
-    return LoadResult(L, LoadFileChunk(L, path), NilValue())
+    path_bytes: Vec(u8)
+    {
+        path, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        BuilderAppend(path_bytes, path)
+    }
+    status := LoadFileChunk(L, BytesView(*path_bytes))
+    VecFree(path_bytes)
+    return LoadResult(L, status, NilValue())
 }
 
 BaseDoFile :: (L: *LuaState) -> s32 {
-    path, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
+    path_bytes: Vec(u8)
+    {
+        path, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        BuilderAppend(path_bytes, path)
+    }
     th := L.cur
     func := L.threads[th].top
-    if LoadFileChunk(L, path) != LUA_OK { return LuaRaiseError(L) }
+    status := LoadFileChunk(L, BytesView(*path_bytes))
+    VecFree(path_bytes)
+    if status != LUA_OK { return LuaRaiseError(L) }
     if !CallValue(L, func, 0, LUA_MULTRET) { return LUA_NATIVE_ERROR }
     return cast(s32)(L.threads[th].top - func)
 }
@@ -516,21 +557,30 @@ BaseSetFenv :: (L: *LuaState) -> s32 {
 }
 
 BaseCollectGarbage :: (L: *LuaState) -> s32 {
-    option, ok := LuaOptString(L, 1, "collect")
-    if !ok { return LUA_NATIVE_ERROR }
-    if option == "count" {
+    action: s32
+    {
+        option, ok := LuaOptString(L, 1, "collect")
+        if !ok { return LUA_NATIVE_ERROR }
+        if option == "count" { action = 1 }
+        else if option == "collect" { action = 2 }
+        else if option == "step" { action = 3 }
+        else if option == "stop" { action = 4 }
+        else if option == "restart" { action = 5 }
+        else if option == "setpause" || option == "setstepmul" { action = 6 }
+    }
+    if action == 1 {
         Push(L, NumberValue(cast(float64) L.allocated / 1024.0))
         Push(L, NumberValue(cast(float64)(L.allocated % 1024)))
         return 2
     }
-    if option == "collect" || option == "step" {
+    if action == 2 || action == 3 {
         if !L.collecting { CollectGarbage(L) }
-        if option == "step" { return ReturnValue(L, BoolValue(true)) }
+        if action == 3 { return ReturnValue(L, BoolValue(true)) }
         return ReturnValue(L, NumberValue(0.0))
     }
-    if option == "stop" { L.threshold = 9223372036854775807; return ReturnValue(L, NumberValue(0.0)) }
-    if option == "restart" { L.threshold = L.allocated * 2; return ReturnValue(L, NumberValue(0.0)) }
-    if option == "setpause" || option == "setstepmul" { return ReturnValue(L, NumberValue(200.0)) }
+    if action == 4 { L.threshold = 9223372036854775807; return ReturnValue(L, NumberValue(0.0)) }
+    if action == 5 { L.threshold = L.allocated * 2; return ReturnValue(L, NumberValue(0.0)) }
+    if action == 6 { return ReturnValue(L, NumberValue(200.0)) }
     return LuaArgError(L, 1, "invalid option")
 }
 
@@ -560,9 +610,12 @@ PackageTable :: (L: *LuaState, name: string) -> s32 {
 }
 
 BaseRequire :: (L: *LuaState) -> s32 {
-    name, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
-    key := Intern(L, name)
+    key: s32
+    {
+        name, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        key = Arg(L, 1).h
+    }
     loaded := PackageTable(L, "loaded")
     if loaded >= 0 {
         v := GetStr(L, loaded, key)

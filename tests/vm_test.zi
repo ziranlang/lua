@@ -106,10 +106,12 @@ Wait :: (L: *LuaState) -> s32 {
 }
 
 Handler :: (L: *LuaState) -> s32 {
-    message, ok := LuaToString(L, 1)
     text: Vec(u8)
-    BuilderAppend(text, "handled: ")
-    BuilderAppend(text, message)
+    {
+        message, ok := LuaToString(L, 1)
+        BuilderAppend(text, "handled: ")
+        BuilderAppend(text, message)
+    }
     LuaPushString(L, TextView(VecSlice(text, 0, text.count)))
     VecFree(text)
     return 1
@@ -162,8 +164,10 @@ TestValues :: (L: *LuaState) {
     Expect(LuaToBoolean(L, 2) && !LuaToBoolean(L, 1), "truthiness")
     Expect(LuaToNumber(L, 3) == 2.5 && LuaToInteger(L, 4) == 42, "numbers read back")
     Expect(TopText(L) == "hi", "string reads back")
-    text, ok := LuaToString(L, 4)
-    Expect(ok && text == "42", "number converts to string")
+    {
+        text, ok := LuaToString(L, 4)
+        Expect(ok && text == "42", "number converts to string")
+    }
     Expect(!LuaIsString(L, 2) && LuaIsNumber(L, 4) && LuaIsString(L, 4), "string and number checks")
 
     // Stack shuffling: [nil true 2.5 42 "hi"].

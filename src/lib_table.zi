@@ -50,8 +50,10 @@ TabRemove :: (L: *LuaState) -> s32 {
 TabConcat :: (L: *LuaState) -> s32 {
     t := TableArg(L, 1)
     if t < 0 { return LUA_NATIVE_ERROR }
-    sep, ok1 := LuaOptString(L, 2, "")
-    if !ok1 { return LUA_NATIVE_ERROR }
+    {
+        sep, ok1 := LuaOptString(L, 2, "")
+        if !ok1 { return LUA_NATIVE_ERROR }
+    }
     first, ok2 := LuaOptInteger(L, 3, 1)
     if !ok2 { return LUA_NATIVE_ERROR }
     last: s64 = 0
@@ -80,7 +82,7 @@ TabConcat :: (L: *LuaState) -> s32 {
             VecFree(message)
             return result
         }
-        if i < last { BuilderAppend(out, sep) }
+        if i < last && Arg(L, 2).t != LUA_TNIL { BuilderAppend(out, StrView(L, Arg(L, 2).h)) }
         i += 1
     }
     Push(L, StringValue(InternBytes(L, *out)))

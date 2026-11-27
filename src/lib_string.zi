@@ -372,12 +372,18 @@ InitMatch :: (ms: *MatchState, L: *LuaState, src: string, pat: string) {
 }
 
 FindAux :: (L: *LuaState, find: bool) -> s32 {
-    s, ok1 := LuaCheckString(L, 1)
-    if !ok1 { return LUA_NATIVE_ERROR }
-    p, ok2 := LuaCheckString(L, 2)
-    if !ok2 { return LUA_NATIVE_ERROR }
+    {
+        s, ok1 := LuaCheckString(L, 1)
+        if !ok1 { return LUA_NATIVE_ERROR }
+    }
+    {
+        p, ok2 := LuaCheckString(L, 2)
+        if !ok2 { return LUA_NATIVE_ERROR }
+    }
     init, ok3 := LuaOptInteger(L, 3, 1)
     if !ok3 { return LUA_NATIVE_ERROR }
+    s := StrView(L, Arg(L, 1).h)
+    p := StrView(L, Arg(L, 2).h)
     init = StringPosition(init, s.count) - 1
     if init < 0 { init = 0 }
     if init > s.count { return ReturnNil(L) }
@@ -449,10 +455,14 @@ GmatchStep :: (L: *LuaState) -> s32 {
 }
 
 StrGmatch :: (L: *LuaState) -> s32 {
-    s, ok1 := LuaCheckString(L, 1)
-    if !ok1 { return LUA_NATIVE_ERROR }
-    p, ok2 := LuaCheckString(L, 2)
-    if !ok2 { return LUA_NATIVE_ERROR }
+    {
+        s, ok1 := LuaCheckString(L, 1)
+        if !ok1 { return LUA_NATIVE_ERROR }
+    }
+    {
+        p, ok2 := LuaCheckString(L, 2)
+        if !ok2 { return LUA_NATIVE_ERROR }
+    }
     Push(L, Arg(L, 1))
     Push(L, Arg(L, 2))
     Push(L, NumberValue(0.0))
@@ -525,50 +535,56 @@ AddReplacement :: (ms: *MatchState, out: *Vec(u8), s: s64, e: s64, repl: LuaValu
 }
 
 StrGsub :: (L: *LuaState) -> s32 {
-    s, ok1 := LuaCheckString(L, 1)
-    if !ok1 { return LUA_NATIVE_ERROR }
-    p, ok2 := LuaCheckString(L, 2)
-    if !ok2 { return LUA_NATIVE_ERROR }
+    {
+        s, ok1 := LuaCheckString(L, 1)
+        if !ok1 { return LUA_NATIVE_ERROR }
+    }
+    {
+        p, ok2 := LuaCheckString(L, 2)
+        if !ok2 { return LUA_NATIVE_ERROR }
+    }
     repl := Arg(L, 3)
     if repl.t != LUA_TNUMBER && repl.t != LUA_TSTRING && repl.t != LUA_TTABLE && repl.t != LUA_TFUNCTION {
         return LuaArgError(L, 3, "string/function/table expected")
     }
-    max_n, ok3 := LuaOptInteger(L, 4, s.count + 1)
+    max_n, ok3 := LuaOptInteger(L, 4, StrLen(L, Arg(L, 1).h) + 1)
     if !ok3 { return LUA_NATIVE_ERROR }
-    // Keep the subject and pattern alive across replacement callbacks.
-    subject_h := Arg(L, 1).h
-    pattern := p
-    anchor := pattern.count > 0 && pattern[0] == #char "^"
-    if anchor { pattern = pattern[1:] }
-    ms: MatchState
-    InitMatch(*ms, L, s, pattern)
     out: Vec(u8)
-    at: s64 = 0
     n: s64 = 0
-    while n < max_n {
-        ms.level = 0
-        ms.depth = 0
-        e := DoMatch(*ms, at, 0)
-        if ms.failed { VecFree(out); return LUA_NATIVE_ERROR }
-        if e >= 0 {
-            n += 1
-            if !AddReplacement(*ms, *out, at, e, repl) { VecFree(out); return LUA_NATIVE_ERROR }
+    // Arguments stay rooted on the VM stack across replacement callbacks.
+    {
+        s := StrView(L, Arg(L, 1).h)
+        p := StrView(L, Arg(L, 2).h)
+        pattern := p
+        anchor := pattern.count > 0 && pattern[0] == #char "^"
+        if anchor { pattern = pattern[1:] }
+        ms: MatchState
+        InitMatch(*ms, L, s, pattern)
+        at: s64 = 0
+        while n < max_n {
+            ms.level = 0
+            ms.depth = 0
+            e := DoMatch(*ms, at, 0)
+            if ms.failed { VecFree(out); return LUA_NATIVE_ERROR }
+            if e >= 0 {
+                n += 1
+                if !AddReplacement(*ms, *out, at, e, repl) { VecFree(out); return LUA_NATIVE_ERROR }
+            }
+            if e >= 0 && e > at {
+                at = e
+            } else if at < s.count {
+                VecPush(out, s[at])
+                at += 1
+            } else {
+                break
+            }
+            if anchor { break }
         }
-        if e >= 0 && e > at {
-            at = e
-        } else if at < s.count {
-            VecPush(out, s[at])
-            at += 1
-        } else {
-            break
-        }
-        if anchor { break }
+        if at < s.count { BuilderAppend(out, s[at:]) }
     }
-    if at < s.count { BuilderAppend(out, s[at:]) }
     Push(L, StringValue(InternBytes(L, *out)))
     Push(L, NumberValue(cast(float64) n))
     VecFree(out)
-    subject_h = subject_h
     return 2
 }
 
@@ -579,30 +595,35 @@ StrLength :: (L: *LuaState) -> s32 {
 }
 
 StrSub :: (L: *LuaState) -> s32 {
-    s, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
+    {
+        s, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+    }
     i, ok2 := LuaOptInteger(L, 2, 1)
     j, ok3 := LuaOptInteger(L, 3, -1)
     if !ok2 || !ok3 { return LUA_NATIVE_ERROR }
-    l := s.count
+    handle := Arg(L, 1).h
+    l := StrLen(L, handle)
     start := StringPosition(i, l)
     end := StringPosition(j, l)
     if start < 1 { start = 1 }
     if end > l { end = l }
     if start > end { return ReturnValue(L, StringValue(Intern(L, ""))) }
     if start == 1 && end == l { return ReturnValue(L, Arg(L, 1)) }
-    return ReturnValue(L, StringValue(Intern(L, s[start - 1:end])))
+    return ReturnValue(L, StringValue(InternStringSpan(L, handle, start - 1, end)))
 }
 
 StrUpper :: (L: *LuaState) -> s32 {
-    s, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
     out: Vec(u8)
-    i: s64 = 0
-    while i < s.count {
-        c := s[i]
-        VecPush(out, ifx IsLowerByte(c) then c - 32 else c)
-        i += 1
+    {
+        s, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        i: s64 = 0
+        while i < s.count {
+            c := s[i]
+            VecPush(out, ifx IsLowerByte(c) then c - 32 else c)
+            i += 1
+        }
     }
     Push(L, StringValue(InternBytes(L, *out)))
     VecFree(out)
@@ -610,14 +631,16 @@ StrUpper :: (L: *LuaState) -> s32 {
 }
 
 StrLower :: (L: *LuaState) -> s32 {
-    s, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
     out: Vec(u8)
-    i: s64 = 0
-    while i < s.count {
-        c := s[i]
-        VecPush(out, ifx IsUpperByte(c) then c + 32 else c)
-        i += 1
+    {
+        s, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        i: s64 = 0
+        while i < s.count {
+            c := s[i]
+            VecPush(out, ifx IsUpperByte(c) then c + 32 else c)
+            i += 1
+        }
     }
     Push(L, StringValue(InternBytes(L, *out)))
     VecFree(out)
@@ -625,22 +648,33 @@ StrLower :: (L: *LuaState) -> s32 {
 }
 
 StrRep :: (L: *LuaState) -> s32 {
-    s, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
+    {
+        s, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+    }
     n, ok2 := LuaCheckInteger(L, 2)
     if !ok2 { return LUA_NATIVE_ERROR }
-    sep, ok3 := LuaOptString(L, 3, "")
-    if !ok3 { return LUA_NATIVE_ERROR }
+    {
+        sep, ok3 := LuaOptString(L, 3, "")
+        if !ok3 { return LUA_NATIVE_ERROR }
+    }
+    handle := Arg(L, 1).h
+    separator := ifx Arg(L, 3).t == LUA_TNIL then -1 else Arg(L, 3).h
     if n <= 0 { return ReturnValue(L, StringValue(Intern(L, ""))) }
-    total := (s.count + sep.count) * n
+    separator_count := ifx separator < 0 then 0 else StrLen(L, separator)
+    total := (StrLen(L, handle) + separator_count) * n
     if total > 268435456 { return LuaErrorText(L, "resulting string too large") }
     out: Vec(u8)
     VecReserve(out, total)
-    i: s64 = 0
-    while i < n {
-        if i > 0 { BuilderAppend(out, sep) }
-        BuilderAppend(out, s)
-        i += 1
+    {
+        s := StrView(L, handle)
+        sep := ifx separator < 0 then "" else StrView(L, separator)
+        i: s64 = 0
+        while i < n {
+            if i > 0 { BuilderAppend(out, sep) }
+            BuilderAppend(out, s)
+            i += 1
+        }
     }
     Push(L, StringValue(InternBytes(L, *out)))
     VecFree(out)
@@ -648,24 +682,29 @@ StrRep :: (L: *LuaState) -> s32 {
 }
 
 StrReverse :: (L: *LuaState) -> s32 {
-    s, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
     out: Vec(u8)
-    i := s.count - 1
-    while i >= 0 { VecPush(out, s[i]); i -= 1 }
+    {
+        s, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        i := s.count - 1
+        while i >= 0 { VecPush(out, s[i]); i -= 1 }
+    }
     Push(L, StringValue(InternBytes(L, *out)))
     VecFree(out)
     return 1
 }
 
 StrByte :: (L: *LuaState) -> s32 {
-    s, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
+    {
+        s, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+    }
     i, ok2 := LuaOptInteger(L, 2, 1)
     if !ok2 { return LUA_NATIVE_ERROR }
     j, ok3 := LuaOptInteger(L, 3, i)
     if !ok3 { return LUA_NATIVE_ERROR }
-    l := s.count
+    handle := Arg(L, 1).h
+    l := StrLen(L, handle)
     start := StringPosition(i, l)
     end := StringPosition(j, l)
     if start < 1 { start = 1 }
@@ -675,7 +714,7 @@ StrByte :: (L: *LuaState) -> s32 {
     if !EnsureStack(L, Top(L) + n + 1) { return LuaErrorText(L, "string slice too long") }
     k := start
     while k <= end {
-        Push(L, NumberValue(cast(float64) s[k - 1]))
+        Push(L, NumberValue(cast(float64) L.strings[handle].bytes[k - 1]))
         k += 1
     }
     return cast(s32) n
@@ -722,30 +761,30 @@ AppendQuoted :: (out: *Vec(u8), s: string) {
 }
 
 // Pad body to width: left-justified, or with zeros after any sign/prefix.
-AppendPadded :: (out: *Vec(u8), body: *Vec(u8), width: s64, left: bool, zero: bool, prefix_len: s64) {
+AppendPadded :: (out: *Vec(u8), body: string, width: s64, left: bool, zero: bool, prefix_len: s64) {
     pad := width - body.count
     if pad <= 0 {
-        BuilderAppend(<<out, BytesView(body))
+        BuilderAppend(<<out, body)
         return
     }
     if left {
-        BuilderAppend(<<out, BytesView(body))
+        BuilderAppend(<<out, body)
         i: s64 = 0
         while i < pad { VecPush(<<out, #char " "); i += 1 }
         return
     }
     if zero {
         i: s64 = 0
-        while i < prefix_len { VecPush(<<out, (<<body)[i]); i += 1 }
+        while i < prefix_len { VecPush(<<out, body[i]); i += 1 }
         i = 0
         while i < pad { VecPush(<<out, #char "0"); i += 1 }
         i = prefix_len
-        while i < body.count { VecPush(<<out, (<<body)[i]); i += 1 }
+        while i < body.count { VecPush(<<out, body[i]); i += 1 }
         return
     }
     i: s64 = 0
     while i < pad { VecPush(<<out, #char " "); i += 1 }
-    BuilderAppend(<<out, BytesView(body))
+    BuilderAppend(<<out, body)
 }
 
 AppendUnsigned :: (out: *Vec(u8), value: u64, base: u64, upper: bool) {
@@ -827,21 +866,25 @@ AppendHexFloat :: (out: *Vec(u8), x: float64, upper: bool, precision: s64, alt: 
 }
 
 StrFormat :: (L: *LuaState) -> s32 {
-    format, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
+    {
+        format, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+    }
+    format_handle := Arg(L, 1).h
+    format_count := StrLen(L, format_handle)
     out: Vec(u8)
     body: Vec(u8)
     arg: s32 = 1
     i: s64 = 0
-    while i < format.count {
-        c := format[i]
+    while i < format_count {
+        c := L.strings[format_handle].bytes[i]
         if c != #char "%" {
             VecPush(out, c)
             i += 1
             continue
         }
         i += 1
-        if i < format.count && format[i] == #char "%" {
+        if i < format_count && L.strings[format_handle].bytes[i] == #char "%" {
             VecPush(out, #char "%")
             i += 1
             continue
@@ -851,8 +894,8 @@ StrFormat :: (L: *LuaState) -> s32 {
         space := false
         alt := false
         zero := false
-        while i < format.count {
-            f := format[i]
+        while i < format_count {
+            f := L.strings[format_handle].bytes[i]
             if f == #char "-" { left = true }
             else if f == #char "+" { plus = true }
             else if f == #char " " { space = true }
@@ -863,27 +906,27 @@ StrFormat :: (L: *LuaState) -> s32 {
         }
         width: s64 = 0
         digits: s32 = 0
-        while i < format.count && IsDigit(format[i]) {
-            width = width * 10 + cast(s64)(format[i] - #char "0")
+        while i < format_count && IsDigit(L.strings[format_handle].bytes[i]) {
+            width = width * 10 + cast(s64)(L.strings[format_handle].bytes[i] - #char "0")
             i += 1
             digits += 1
         }
         precision: s64 = -1
-        if i < format.count && format[i] == #char "." {
+        if i < format_count && L.strings[format_handle].bytes[i] == #char "." {
             i += 1
             precision = 0
-            while i < format.count && IsDigit(format[i]) {
-                precision = precision * 10 + cast(s64)(format[i] - #char "0")
+            while i < format_count && IsDigit(L.strings[format_handle].bytes[i]) {
+                precision = precision * 10 + cast(s64)(L.strings[format_handle].bytes[i] - #char "0")
                 i += 1
                 digits += 1
             }
         }
-        if digits > 4 || i >= format.count {
+        if digits > 4 || i >= format_count {
             VecFree(out)
             VecFree(body)
             return LuaErrorText(L, "invalid format (repeated flags)")
         }
-        conv := format[i]
+        conv := L.strings[format_handle].bytes[i]
         i += 1
         arg += 1
         VecClear(body)
@@ -905,7 +948,7 @@ StrFormat :: (L: *LuaState) -> s32 {
             }
             BuilderAppend(body, BytesView(*digits_text))
             VecFree(digits_text)
-            AppendPadded(*out, *body, width, left, zero && precision < 0, prefix)
+            AppendPadded(*out, BytesView(*body), width, left, zero && precision < 0, prefix)
         } else if conv == #char "u" || conv == #char "o" || conv == #char "x" || conv == #char "X" {
             n, okn := LuaCheckNumber(L, arg)
             if !okn { VecFree(out); VecFree(body); return LUA_NATIVE_ERROR }
@@ -926,25 +969,25 @@ StrFormat :: (L: *LuaState) -> s32 {
             }
             BuilderAppend(body, BytesView(*digits_text))
             VecFree(digits_text)
-            AppendPadded(*out, *body, width, left, zero && precision < 0, prefix)
+            AppendPadded(*out, BytesView(*body), width, left, zero && precision < 0, prefix)
         } else if conv == #char "c" {
             n, okn := LuaCheckNumber(L, arg)
             if !okn { VecFree(out); VecFree(body); return LUA_NATIVE_ERROR }
             VecPush(body, cast(u8)(NumberToS64(n) & 255))
-            AppendPadded(*out, *body, width, left, false, 0)
+            AppendPadded(*out, BytesView(*body), width, left, false, 0)
         } else if conv == #char "e" || conv == #char "E" || conv == #char "f" || conv == #char "F" || conv == #char "g" || conv == #char "G" {
             n, okn := LuaCheckNumber(L, arg)
             if !okn { VecFree(out); VecFree(body); return LUA_NATIVE_ERROR }
             FormatFloat(*body, n, conv, cast(s32)(ifx precision < 0 then 6 else precision), alt, plus, space)
             if body.count > 0 && (body[0] == #char "-" || body[0] == #char "+" || body[0] == #char " ") { prefix = 1 }
             finite := n == n && n - n == 0.0
-            AppendPadded(*out, *body, width, left, zero && finite, prefix)
+            AppendPadded(*out, BytesView(*body), width, left, zero && finite, prefix)
         } else if conv == #char "a" || conv == #char "A" {
             n, okn := LuaCheckNumber(L, arg)
             if !okn { VecFree(out); VecFree(body); return LUA_NATIVE_ERROR }
             AppendHexFloat(*body, n, conv == #char "A", precision, alt, plus, space)
             if body.count > 0 && (body[0] == #char "-" || body[0] == #char "+" || body[0] == #char " ") { prefix = 1 }
-            AppendPadded(*out, *body, width, left, false, prefix)
+            AppendPadded(*out, BytesView(*body), width, left, false, prefix)
         } else if conv == #char "q" {
             s, oks := LuaCheckString(L, arg)
             if !oks { VecFree(out); VecFree(body); return LUA_NATIVE_ERROR }
@@ -964,7 +1007,7 @@ StrFormat :: (L: *LuaState) -> s32 {
             } else {
                 AppendValueText(L, *body, text)
             }
-            AppendPadded(*out, *body, width, left, false, 0)
+            AppendPadded(*out, BytesView(*body), width, left, false, 0)
         } else {
             message: Vec(u8)
             BuilderAppend(message, "invalid option '%")

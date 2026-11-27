@@ -203,8 +203,10 @@ AppendDateField :: (out: *Vec(u8), conv: u8, when: LocalDateTime, utc: bool) -> 
 }
 
 OsDate :: (L: *LuaState) -> s32 {
-    format, ok := LuaOptString(L, 1, "%c")
-    if !ok { return LUA_NATIVE_ERROR }
+    {
+        format, ok := LuaOptString(L, 1, "%c")
+        if !ok { return LUA_NATIVE_ERROR }
+    }
     seconds: s64 = 0
     if Arg(L, 2).t == LUA_TNIL {
         seconds = UnixNow()
@@ -213,15 +215,39 @@ OsDate :: (L: *LuaState) -> s32 {
         if !okn { return LUA_NATIVE_ERROR }
         seconds = SafeInteger(Floor(n))
     }
-    utc := false
-    text := format
-    if text.count > 0 && text[0] == #char "!" {
-        utc = true
-        text = text[1:]
+    when: LocalDateTime
+    as_table: bool
+    out: Vec(u8)
+    {
+        format := ifx Arg(L, 1).t == LUA_TNIL then "%c" else StrView(L, Arg(L, 1).h)
+        utc := false
+        text := format
+        if text.count > 0 && text[0] == #char "!" {
+            utc = true
+            text = text[1:]
+        }
+        when = ifx utc then UtcAt(seconds) else LocalAt(seconds)
+        as_table = text.count >= 2 && text[0] == #char "*" && text[1] == #char "t"
+        if when.valid && !as_table {
+            i: s64 = 0
+            while i < text.count {
+                c := text[i]
+                if c == #char "%" && i + 1 < text.count {
+                    conv := text[i + 1]
+                    if !AppendDateField(*out, conv, when, utc) {
+                        VecPush(out, #char "%")
+                        VecPush(out, conv)
+                    }
+                    i += 2
+                    continue
+                }
+                VecPush(out, c)
+                i += 1
+            }
+        }
     }
-    when := ifx utc then UtcAt(seconds) else LocalAt(seconds)
     if !when.valid { return ReturnNil(L) }
-    if text.count >= 2 && text[0] == #char "*" && text[1] == #char "t" {
+    if as_table {
         t := NewTable(L, 0, 9)
         SetValue(L, t, "year", NumberValue(cast(float64) when.year))
         SetValue(L, t, "month", NumberValue(cast(float64) when.month))
@@ -233,22 +259,6 @@ OsDate :: (L: *LuaState) -> s32 {
         SetValue(L, t, "yday", NumberValue(cast(float64)(when.day_of_year + 1)))
         SetValue(L, t, "isdst", BoolValue(false))
         return ReturnValue(L, TableValue(t))
-    }
-    out: Vec(u8)
-    i: s64 = 0
-    while i < text.count {
-        c := text[i]
-        if c == #char "%" && i + 1 < text.count {
-            conv := text[i + 1]
-            if !AppendDateField(*out, conv, when, utc) {
-                VecPush(out, #char "%")
-                VecPush(out, conv)
-            }
-            i += 2
-            continue
-        }
-        VecPush(out, c)
-        i += 1
     }
     Push(L, StringValue(InternBytes(L, *out)))
     VecFree(out)
@@ -272,10 +282,13 @@ EnvironmentAllowed :: (L: *LuaState, name: string) -> bool {
 }
 
 OsGetenv :: (L: *LuaState) -> s32 {
-    name, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
-    if name.count == 0 || name.count > 200 || !EnvironmentAllowed(L, name) { return ReturnNil(L) }
-    value := EnvironmentText(name)
+    value: string
+    {
+        name, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+        if name.count == 0 || name.count > 200 || !EnvironmentAllowed(L, name) { return ReturnNil(L) }
+        value = EnvironmentText(name)
+    }
     if value.count == 0 { return ReturnNil(L) }
     return ReturnValue(L, StringValue(Intern(L, value)))
 }
@@ -341,11 +354,14 @@ FileState :: (L: *LuaState, n: s32) -> s32 {
     return -1
 }
 
-OpenFileObject :: (L: *LuaState, path: string) -> bool {
+OpenFileObject :: (L: *LuaState, path_handle: s32) -> bool {
     full: Vec(u8)
-    if !ResolvePath(L, path, *full) {
-        VecFree(full)
-        return false
+    {
+        path := StrView(L, path_handle)
+        if !ResolvePath(L, path, *full) {
+            VecFree(full)
+            return false
+        }
     }
     bytes: Vec(u8)
     if !ReadFileInto(BytesView(*full), *bytes) {
@@ -367,23 +383,30 @@ OpenFileObject :: (L: *LuaState, path: string) -> bool {
 }
 
 IoOpen :: (L: *LuaState) -> s32 {
-    path, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
-    mode, okm := LuaOptString(L, 2, "r")
-    if !okm { return LUA_NATIVE_ERROR }
-    if mode.count == 0 || mode[0] != #char "r" || (mode.count > 1 && mode[1] == #char "+") {
+    {
+        path, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+    }
+    readable: bool
+    {
+        mode, okm := LuaOptString(L, 2, "r")
+        if !okm { return LUA_NATIVE_ERROR }
+        readable = mode.count > 0 && mode[0] == #char "r" && !(mode.count > 1 && mode[1] == #char "+")
+    }
+    path_handle := Arg(L, 1).h
+    if !readable {
         Push(L, NilValue())
         text: Vec(u8)
-        BuilderAppend(text, path)
+        BuilderAppend(text, StrView(L, path_handle))
         BuilderAppend(text, ": writing is not allowed in this sandbox")
         Push(L, StringValue(InternBytes(L, *text)))
         VecFree(text)
         return 2
     }
-    if OpenFileObject(L, path) { return 1 }
+    if OpenFileObject(L, path_handle) { return 1 }
     Push(L, NilValue())
     text: Vec(u8)
-    BuilderAppend(text, path)
+    BuilderAppend(text, StrView(L, path_handle))
     BuilderAppend(text, ": No such file or directory")
     Push(L, StringValue(InternBytes(L, *text)))
     VecFree(text)
@@ -393,44 +416,54 @@ IoOpen :: (L: *LuaState) -> s32 {
 
 // Read one item by format from the file state; false at end of file.
 ReadItem :: (L: *LuaState, state: s32, format: LuaValue, out: *LuaValue) -> bool {
-    data := StrView(L, GetInt(L, state, FILE_DATA).h)
+    handle := GetInt(L, state, FILE_DATA).h
+    size := StrLen(L, handle)
     position := SafeInteger(GetInt(L, state, FILE_POSITION).n)
     if format.t == LUA_TNUMBER {
         count := SafeInteger(format.n)
-        if position >= data.count && count > 0 { return false }
-        if position >= data.count { <<out = StringValue(Intern(L, "")); return true }
+        if position >= size && count > 0 { return false }
+        if position >= size { <<out = StringValue(Intern(L, "")); return true }
         end := position + count
-        if end > data.count { end = data.count }
-        <<out = StringValue(Intern(L, data[position:end]))
+        if end > size { end = size }
+        <<out = StringValue(InternStringSpan(L, handle, position, end))
         SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) end))
         return true
     }
-    spec := ifx format.t == LUA_TSTRING then StrView(L, format.h) else "*l"
-    if spec.count > 0 && spec[0] == #char "*" { spec = spec[1:] }
-    kind: u8 = ifx spec.count > 0 then spec[0] else #char "l"
+    kind: u8
+    {
+        spec := ifx format.t == LUA_TSTRING then StrView(L, format.h) else "*l"
+        if spec.count > 0 && spec[0] == #char "*" { spec = spec[1:] }
+        kind = ifx spec.count > 0 then spec[0] else #char "l"
+    }
     if kind == #char "a" {
-        <<out = StringValue(Intern(L, data[position:]))
-        SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) data.count))
+        <<out = StringValue(InternStringSpan(L, handle, position, size))
+        SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) size))
         return true
     }
     if kind == #char "n" {
-        at := position
-        while at < data.count && IsSpace(data[at]) { at += 1 }
-        end := at
-        while end < data.count && !IsSpace(data[end]) { end += 1 }
-        value, ok := ParseNumberText(data[at:end])
-        if !ok { return false }
+        end: s64
+        value: float64
+        {
+            data := StrView(L, handle)
+            at := position
+            while at < size && IsSpace(data[at]) { at += 1 }
+            end = at
+            while end < size && !IsSpace(data[end]) { end += 1 }
+            parsed, ok := ParseNumberText(data[at:end])
+            if !ok { return false }
+            value = parsed
+        }
         <<out = NumberValue(value)
         SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) end))
         return true
     }
-    if position >= data.count { return false }
+    if position >= size { return false }
     end := position
-    while end < data.count && data[end] != 10 { end += 1 }
+    while end < size && L.strings[handle].bytes[end] != 10 { end += 1 }
     line_end := end
-    if kind == #char "L" && end < data.count { line_end = end + 1 }
-    <<out = StringValue(Intern(L, data[position:line_end]))
-    next := ifx end < data.count then end + 1 else end
+    if kind == #char "L" && end < size { line_end = end + 1 }
+    <<out = StringValue(InternStringSpan(L, handle, position, line_end))
+    next := ifx end < size then end + 1 else end
     SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) next))
     return true
 }
@@ -474,15 +507,21 @@ FileClose :: (L: *LuaState) -> s32 {
 FileSeek :: (L: *LuaState) -> s32 {
     state := FileState(L, 1)
     if state < 0 { return LUA_NATIVE_ERROR }
-    whence, ok := LuaOptString(L, 2, "cur")
-    if !ok { return LUA_NATIVE_ERROR }
+    origin: s32
+    {
+        whence, ok := LuaOptString(L, 2, "cur")
+        if !ok { return LUA_NATIVE_ERROR }
+        if whence == "set" { origin = 1 }
+        else if whence == "cur" { origin = 2 }
+        else if whence == "end" { origin = 3 }
+    }
     offset, ok2 := LuaOptInteger(L, 3, 0)
     if !ok2 { return LUA_NATIVE_ERROR }
-    size := cast(s64) StrView(L, GetInt(L, state, FILE_DATA).h).count
+    size := StrLen(L, GetInt(L, state, FILE_DATA).h)
     position := SafeInteger(GetInt(L, state, FILE_POSITION).n)
-    if whence == "set" { position = offset }
-    else if whence == "cur" { position += offset }
-    else if whence == "end" { position = size + offset }
+    if origin == 1 { position = offset }
+    else if origin == 2 { position += offset }
+    else if origin == 3 { position = size + offset }
     else { return LuaArgError(L, 2, "invalid option") }
     if position < 0 { position = 0 }
     SetInt(L, state, FILE_POSITION, NumberValue(cast(float64) position))
@@ -520,11 +559,14 @@ FileToString :: (L: *LuaState) -> s32 {
 }
 
 IoLines :: (L: *LuaState) -> s32 {
-    path, ok := LuaCheckString(L, 1)
-    if !ok { return LUA_NATIVE_ERROR }
-    if !OpenFileObject(L, path) {
+    {
+        path, ok := LuaCheckString(L, 1)
+        if !ok { return LUA_NATIVE_ERROR }
+    }
+    path_handle := Arg(L, 1).h
+    if !OpenFileObject(L, path_handle) {
         text: Vec(u8)
-        BuilderAppend(text, path)
+        BuilderAppend(text, StrView(L, path_handle))
         BuilderAppend(text, ": No such file or directory")
         result := LuaErrorText(L, BytesView(*text))
         VecFree(text)
